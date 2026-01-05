@@ -80,13 +80,13 @@ article header h2 {
   font-size: 1.3rem;
   font-weight: 600;
   line-height: 1.3;
-  color: #c6d0f5;
+  color: #D2B48C;
 }
 
 article header h1 a,
 article header h2 a {
   text-decoration: none;
-  color: #c6d0f5;
+  color: #D2B48C;
 }
 
 article header h1 a:hover,
@@ -142,7 +142,7 @@ pre code {
 h1, h2, h3, h4, h5, h6 {
   margin: 1.5rem 0 1rem 0;
   line-height: 1.3;
-  color: #c6d0f5;
+  color: #D2B48C;
 }
 
 @media (max-width: 600px) {
