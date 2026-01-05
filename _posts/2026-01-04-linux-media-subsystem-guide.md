@@ -1,4 +1,5 @@
 ---
+layout: post
 title: "Understanding Linux Media Subsystem: A Developer's Guide"
 date: 2026-01-04 15:30:00 +0800
 excerpt: "Comprehensive guide to the Linux media subsystem architecture, V4L2 framework, and best practices for media device driver development."

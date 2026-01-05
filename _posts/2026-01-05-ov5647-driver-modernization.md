@@ -1,4 +1,5 @@
 ---
+layout: post
 title: "Modernizing the OV5647 Camera Driver: A Journey Through Linux Kernel Development"
 date: 2026-01-05 10:00:00 +0800
 excerpt: "Deep dive into modernizing legacy camera drivers in the Linux kernel, featuring CCI register access helpers and new streaming APIs."
