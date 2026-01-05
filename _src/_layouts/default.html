@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="{{ page.language | default: site.language | default: 'en' }}">
+  <head>
+    <title>{{ page.title | default: site.name }} | {{ site.name }}</title>
+    <meta name="description" content="{{ page.description | default: site.description }}" />
+    
+    <link rel="canonical" href="{{ page.url | absolute_url }}" />
+    {% include head.html %}
+  </head>
+  <body>
+    <header>
+      <div class="title">{ <a href="/">{{ site.name }}</a> }</div>
+      <nav>
+        <ul>
+          <li>
+            <a class="colorscheme" aria-label="Change colorscheme" href="/colorscheme/">
+              
+            </a>
+          </li>
+          <li>
+            <a href="/about-me/">
+              about
+            </a>
+          </li>
+          <li>
+            <a {% if page.nav_current == "/blog/" %}aria-current="page"{% endif %} href="/">
+              blog
+            </a>
+          </li>
+        </ul>
+      </nav>
+    </header>
+
+    <main>
+      {{ content }}
+    </main>
+  </body>
+</html>

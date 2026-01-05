@@ -1,0 +1,47 @@
+name: "Xiaolei Wang"
+description: "Blogging about Linux kernel development, graphics programming, and embedded systems"
+domain: "wangxiaolei12.github.io"
+url: "https://wangxiaolei12.github.io"
+
+permalink: pretty
+
+dark_scheme: catppuccin-frappe
+light_scheme: catppuccin-frappe
+
+plugins:
+  - jekyll-target-blank
+
+target-blank:
+  add_css_classes: external
+
+sass:
+  style: compact
+
+kramdown:
+  syntax_highlighter: rouge
+
+include: [".well-known"]
+
+source: _src
+
+collections:
+  posts:
+    output: true
+    permalink: /blog/:path/index:output_ext
+    name: Posts
+
+defaults:
+  -
+    scope:
+      path: ""
+      type: "posts"
+    values:
+      layout: "post.html"
+      nav_current: "/blog/"
+  -
+    scope:
+      path: ""
+    values:
+      layout: "default.html"
+      language: "en"
+      author: "Xiaolei Wang"
