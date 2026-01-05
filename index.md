@@ -1,4 +1,5 @@
 ---
+layout: default.html
 title: "Latest Posts"
 description: "Xiaolei Wang's blog about Linux kernel development, graphics programming, and embedded systems"
 ---
