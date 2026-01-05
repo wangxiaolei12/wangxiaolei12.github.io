@@ -1,12 +1,19 @@
-/* Xiaolei Wang's Blog Styles - Inspired by modern minimalist design */
+/* Xiaolei Wang's Blog - Maíra Canal Style */
 
+/* Reset and normalize */
 * {
   margin: 0;
   padding: 0;
   box-sizing: border-box;
 }
 
+html {
+  line-height: 1.15;
+  -webkit-text-size-adjust: 100%;
+}
+
 body {
+  margin: 0;
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
   line-height: 1.6;
   color: #333;
@@ -16,19 +23,19 @@ body {
   padding: 20px;
 }
 
-/* Header styling similar to Maíra's design */
+/* Header - exact match to Maíra's style */
 header {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  margin-bottom: 3rem;
+  margin-bottom: 2rem;
   padding-bottom: 1rem;
   border-bottom: 1px solid #eee;
 }
 
 .title {
-  font-size: 1.5rem;
-  font-weight: bold;
+  font-size: 1.2rem;
+  font-weight: normal;
 }
 
 .title a {
@@ -36,25 +43,36 @@ header {
   color: #333;
 }
 
+.title a:hover {
+  color: #0066cc;
+}
+
+/* Navigation - exact match */
 nav ul {
   list-style: none;
   display: flex;
-  gap: 1.5rem;
+  gap: 1rem;
   align-items: center;
+  margin: 0;
+  padding: 0;
+}
+
+nav li {
+  margin: 0;
 }
 
 nav a {
   text-decoration: none;
   color: #666;
-  padding: 0.5rem;
-  border-radius: 4px;
-  transition: all 0.2s ease;
+  padding: 0.3rem 0.6rem;
+  border-radius: 3px;
+  font-size: 0.9rem;
 }
 
 nav a:hover,
 nav a[aria-current="page"] {
-  color: #333;
   background: #f5f5f5;
+  color: #333;
 }
 
 /* Main content */
@@ -62,73 +80,68 @@ main {
   min-height: 60vh;
 }
 
-/* Post list styling */
-.post-list {
-  list-style: none;
-}
-
-.post-item {
-  margin-bottom: 2rem;
-  padding-bottom: 1.5rem;
+/* Article styling - match Maíra's blog post layout */
+article {
+  margin-bottom: 3rem;
+  padding-bottom: 2rem;
   border-bottom: 1px solid #f0f0f0;
 }
 
-.post-item:last-child {
+article:last-child {
   border-bottom: none;
 }
 
-.post-title {
-  font-size: 1.3rem;
-  margin-bottom: 0.5rem;
+article header {
+  margin-bottom: 1rem;
+  border-bottom: none;
+  padding-bottom: 0;
 }
 
-.post-title a {
+article header h1 {
+  font-size: 1.4rem;
+  margin-bottom: 0.5rem;
+  line-height: 1.3;
+  font-weight: 600;
+}
+
+article header h1 a {
   text-decoration: none;
   color: #333;
 }
 
-.post-title a:hover {
+article header h1 a:hover {
   color: #0066cc;
 }
 
-.post-meta {
+article header p {
   color: #666;
   font-size: 0.9rem;
-  margin-bottom: 1rem;
+  margin: 0;
 }
 
-.post-excerpt {
+article header time {
+  color: #666;
+  font-size: 0.9rem;
+}
+
+/* Article content */
+article p {
+  margin-bottom: 1rem;
   color: #555;
   line-height: 1.6;
 }
 
-/* Article content */
-article {
-  margin-bottom: 2rem;
-}
-
-article header {
-  border-bottom: none;
-  margin-bottom: 2rem;
-  padding-bottom: 1rem;
-  border-bottom: 1px solid #eee;
-}
-
-article h1 {
-  font-size: 2rem;
-  margin-bottom: 0.5rem;
-  line-height: 1.3;
-}
-
+/* Post content styling */
+.post-content h1,
 .post-content h2,
-.post-content h3,
-.post-content h4 {
+.post-content h3 {
   margin: 2rem 0 1rem 0;
   line-height: 1.3;
 }
 
-.post-content h2 { font-size: 1.5rem; }
-.post-content h3 { font-size: 1.25rem; }
+.post-content h1 { font-size: 1.8rem; }
+.post-content h2 { font-size: 1.4rem; }
+.post-content h3 { font-size: 1.2rem; }
 
 .post-content p {
   margin-bottom: 1.5rem;
@@ -145,34 +158,38 @@ article h1 {
 
 /* Code styling */
 code {
-  background: #f5f5f5;
+  background: #f8f8f8;
   padding: 0.2rem 0.4rem;
   border-radius: 3px;
   font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
-  font-size: 0.9em;
+  font-size: 0.85em;
+  color: #d73a49;
 }
 
 pre {
-  background: #f8f8f8;
-  padding: 1.5rem;
+  background: #f6f8fa;
+  padding: 1rem;
   border-radius: 6px;
   overflow-x: auto;
   margin: 1.5rem 0;
-  border: 1px solid #e0e0e0;
+  border: 1px solid #e1e4e8;
 }
 
 pre code {
   background: none;
   padding: 0;
+  color: #24292e;
 }
 
 /* Links */
 a {
-  color: #0066cc;
+  color: #0366d6;
+  text-decoration: underline;
 }
 
 a:hover {
-  color: #0052a3;
+  color: #0366d6;
+  text-decoration: none;
 }
 
 /* Responsive design */
@@ -192,42 +209,42 @@ a:hover {
   }
   
   .title {
-    font-size: 1.3rem;
+    font-size: 1.1rem;
+  }
+  
+  article header h1 {
+    font-size: 1.2rem;
   }
 }
 
-/* Dark theme support */
-@media (prefers-color-scheme: dark) {
-  body {
-    background: #1a1a1a;
-    color: #e0e0e0;
-  }
-  
-  .title a {
-    color: #e0e0e0;
-  }
-  
-  nav a {
-    color: #b0b0b0;
-  }
-  
-  nav a:hover,
-  nav a[aria-current="page"] {
-    color: #e0e0e0;
-    background: #333;
-  }
-  
-  .post-title a {
-    color: #e0e0e0;
-  }
-  
-  code {
-    background: #333;
-    color: #e0e0e0;
-  }
-  
-  pre {
-    background: #2a2a2a;
-    border-color: #444;
-  }
+/* Clean, minimal styling matching Maíra's aesthetic */
+blockquote {
+  border-left: 4px solid #dfe2e5;
+  padding-left: 1rem;
+  margin: 1.5rem 0;
+  color: #6a737d;
+  font-style: italic;
+}
+
+hr {
+  border: none;
+  border-top: 1px solid #e1e4e8;
+  margin: 2rem 0;
+}
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 1.5rem 0;
+}
+
+th, td {
+  border: 1px solid #e1e4e8;
+  padding: 0.5rem;
+  text-align: left;
+}
+
+th {
+  background: #f6f8fa;
+  font-weight: 600;
 }
