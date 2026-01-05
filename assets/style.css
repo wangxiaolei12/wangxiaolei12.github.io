@@ -67,7 +67,18 @@ nav a.colorscheme {
   content: "";
   margin: 0.14rem;
   vertical-align: middle;
-  border-radius: 2px;
+  border-radius: 50%;
+  position: relative;
+}
+
+nav a.colorscheme::before {
+  content: "🎨";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  font-size: 0.9rem;
+  background: none;
 }
 
 article {
