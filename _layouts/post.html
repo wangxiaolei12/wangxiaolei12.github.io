@@ -1,11 +1,11 @@
 ---
-layout: default.html
+layout: default
 ---
 
 <article>
   <header>
     <h1>{{ page.title }}</h1>
-    <p><time datetime="{{ page.date | date_to_xmlschema }}">{{ page.date | date: "%B %d, %Y" }}</time></p>
+    <p><time datetime="{{ page.date | date_to_xmlschema }}">{{ page.date | date: "%eth %B %Y" | replace: "1th", "1st" | replace: "2th", "2nd" | replace: "3th", "3rd" | replace: "21th", "21st" | replace: "22th", "22nd" | replace: "23th", "23rd" | replace: "31th", "31st" }}</time></p>
   </header>
 
   <div class="post-content">
