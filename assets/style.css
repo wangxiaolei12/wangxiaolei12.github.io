@@ -1,12 +1,31 @@
-/* Xiaolei Wang's Blog - Exact Maíra Canal Style */
+/* Xiaolei Wang's Blog - Catppuccin Frappe Theme */
 
+/* Catppuccin Frappe Colors */
 :root {
-  --text: #24292e;
-  --background: #ffffff;
-  --border: #e1e4e8;
-  --links: #0366d6;
-  --links-mail: #0366d6;
-  --links-files: #0366d6;
+  --base00: #303446; /* base */
+  --base01: #292c3c; /* mantle */
+  --base02: #414559; /* surface0 */
+  --base03: #51576d; /* surface1 */
+  --base04: #626880; /* surface2 */
+  --base05: #c6d0f5; /* text */
+  --base06: #f2d5cf; /* rosewater */
+  --base07: #babbf1; /* lavender */
+  --base08: #e78284; /* red */
+  --base09: #ef9f76; /* peach */
+  --base0A: #e5c890; /* yellow */
+  --base0B: #a6d189; /* green */
+  --base0C: #81c8be; /* teal */
+  --base0D: #8caaee; /* blue */
+  --base0E: #ca9ee6; /* mauve */
+  --base0F: #eebebe; /* flamingo */
+  
+  /* Semantic colors */
+  --text: var(--base05);
+  --background: var(--base00);
+  --border: var(--base02);
+  --links: var(--base0D);
+  --links-mail: var(--base0D);
+  --links-files: var(--base0D);
 }
 
 * {
@@ -154,7 +173,7 @@ article p {
 }
 
 article time {
-  color: #666;
+  color: var(--base04);
   font-size: 0.9rem;
 }
 
@@ -174,7 +193,8 @@ a.feed {
 
 /* Code styling */
 code {
-  background: #f6f8fa;
+  background: var(--base01);
+  color: var(--base0A);
   padding: 0.2rem 0.4rem;
   border-radius: 3px;
   font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
@@ -182,7 +202,7 @@ code {
 }
 
 pre {
-  background: #f6f8fa;
+  background: var(--base01);
   padding: 1rem;
   border-radius: 6px;
   overflow-x: auto;
@@ -193,12 +213,14 @@ pre {
 pre code {
   background: none;
   padding: 0;
+  color: var(--text);
 }
 
 /* Typography */
 h1, h2, h3, h4, h5, h6 {
   margin: 1.5rem 0 1rem 0;
   line-height: 1.3;
+  color: var(--text);
 }
 
 h1 { font-size: 2em; }
@@ -222,7 +244,7 @@ footer {
   margin-top: 3em;
   border-top: 1px solid var(--border);
   padding-top: 1em;
-  color: #666;
+  color: var(--base04);
   font-size: 0.9rem;
 }
 
