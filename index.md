@@ -12,20 +12,52 @@ description: "Xiaolei Wang's blog about Linux kernel development, graphics progr
 
 <p><a href="/atom.xml" class="feed">Feed</a></p>
 
+<h2>📷 Camera / Linux Media / VPU</h2>
 {% for post in site.posts %}
+{% if post.path contains 'camera-media/' %}
 <article>
 <header>
-<h2><a href="{{ post.url | relative_url }}">{{ post.title | escape }}</a></h2>
+<h3><a href="{{ post.url | relative_url }}">{{ post.title | escape }}</a></h3>
 </header>
-<p>
-<time datetime="{{ post.date | date_to_xmlschema }}">
-{{ post.date | date: "%eth %B %Y" | replace: "1th", "1st" | replace: "2th", "2nd" | replace: "3th", "3rd" | replace: "21th", "21st" | replace: "22th", "22nd" | replace: "23th", "23rd" | replace: "31th", "31st" }}
-</time>
-</p>
-{% if post.excerpt %}
-<p>{{ post.excerpt | strip_html | truncatewords: 50 }}</p>
-{% endif %}
+<p><time datetime="{{ post.date | date_to_xmlschema }}">{{ post.date | date: "%Y-%m-%d" }}</time></p>
 </article>
+{% endif %}
+{% endfor %}
+
+<h2>⚙️ System Internals (内核系统分析)</h2>
+{% for post in site.posts %}
+{% if post.path contains 'system-internals/' %}
+<article>
+<header>
+<h3><a href="{{ post.url | relative_url }}">{{ post.title | escape }}</a></h3>
+</header>
+<p><time datetime="{{ post.date | date_to_xmlschema }}">{{ post.date | date: "%Y-%m-%d" }}</time></p>
+</article>
+{% endif %}
+{% endfor %}
+
+<h2>🏗️ ARM Architecture</h2>
+{% for post in site.posts %}
+{% if post.path contains 'arm-architecture/' %}
+<article>
+<header>
+<h3><a href="{{ post.url | relative_url }}">{{ post.title | escape }}</a></h3>
+</header>
+<p><time datetime="{{ post.date | date_to_xmlschema }}">{{ post.date | date: "%Y-%m-%d" }}</time></p>
+</article>
+{% endif %}
+{% endfor %}
+
+<h2>📝 Interview (面试题)</h2>
+{% for post in site.posts %}
+{% if post.path contains 'interview/' %}
+<article>
+<header>
+<h3><a href="{{ post.url | relative_url }}">{{ post.title | escape }}</a></h3>
+</header>
+<p><time datetime="{{ post.date | date_to_xmlschema }}">{{ post.date | date: "%Y-%m-%d" }}</time></p>
+</article>
+{% endif %}
 {% endfor %}
 
 </article>
