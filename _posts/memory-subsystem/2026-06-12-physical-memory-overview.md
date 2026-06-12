@@ -22,19 +22,21 @@ excerpt: "Linux 物理内存管理的基础架构：NUMA Node、Zone 划分、st
 │  │  │                       │    │                       │            │    │
 │  │  │ ┌────────────────┐    │    │ ┌────────────────┐    │            │    │
 │  │  │ │ ZONE_DMA       │    │    │ │ ZONE_DMA       │    │            │    │
-│  │  │ │ 0~16MB         │    │    │ │                │    │            │    │
+│  │  │ │(x86:0~16M      │    │    │ │                │    │            │    │
+│  │  │ │ arm64:0~1G)    │    │    │ │                │    │            │    │
 │  │  │ ├────────────────┤    │    │ ├────────────────┤    │            │    │
 │  │  │ │ ZONE_DMA32     │    │    │ │ ZONE_DMA32     │    │            │    │
-│  │  │ │ 16MB~4GB       │    │    │ │                │    │            │    │
+│  │  │ │ ~4GB           │    │    │ │                │    │            │    │
 │  │  │ ├────────────────┤    │    │ ├────────────────┤    │            │    │
 │  │  │ │ ZONE_NORMAL    │    │    │ │ ZONE_NORMAL    │    │            │    │
 │  │  │ │ 4GB~...        │    │    │ │                │    │            │    │
 │  │  │ ├────────────────┤    │    │ ├────────────────┤    │            │    │
 │  │  │ │ ZONE_MOVABLE   │    │    │ │ ZONE_MOVABLE   │    │            │    │
-│  │  │ │ (可迁移页)      │    │    │ │                │    │            │    │
+│  │  │ │ (虚拟zone)     │    │    │ │                │    │            │    │
 │  │  │ └────────────────┘    │    │ └────────────────┘    │            │    │
 │  │  └───────────────────────┘    └───────────────────────┘            │    │
 │  └─────────────────────────────────────────────────────────────────────┘    │
+│  注: Zone 是否存在及范围因架构/配置/DT而异，并非所有平台都有全部 zone        │
 │                                                                             │
 │  每个 Zone 内部:                                                            │
 │  ┌────────────────────────────────────────────────┐                         │
@@ -76,16 +78,33 @@ extern struct pglist_data *node_data[];    // node_data[nid]
 
 ## 三、Zone — 内存区域
 
-不同 zone 对应不同物理地址约束：
+不同 zone 对应不同物理地址约束（**因架构而异**）：
 
 ```c
 enum zone_type {
-    ZONE_DMA,       // ISA DMA: 0~16MB (x86)
-    ZONE_DMA32,     // 32-bit DMA: 0~4GB
-    ZONE_NORMAL,    // 正常可映射内存
-    ZONE_MOVABLE,   // 可迁移页(热插拔/CMA)
+    ZONE_DMA,       // 受限 DMA 设备可达范围
+                    //   x86_64: 0~16MB (ISA DMA 兼容)
+                    //   ARM64:  0~dma_phys_limit (来自 DT dma-ranges, 通常 0~1GB)
+                    //   某些 ARM64 配置可能不存在此 zone
+    ZONE_DMA32,     // 32-bit DMA 设备可达: 0~4GB
+    ZONE_NORMAL,    // 所有物理内存 (64-bit 无高端内存问题)
+    ZONE_MOVABLE,   // 可迁移页 (热插拔/CMA, 虚拟 zone)
     MAX_NR_ZONES
 };
+```
+
+**各架构 Zone 对比：**
+
+| 架构 | ZONE_DMA | ZONE_DMA32 | ZONE_NORMAL | 说明 |
+|------|----------|-----------|-------------|------|
+| x86_64 | 0~16MB | 16MB~4GB | 4GB+ | 三个都有，DMA 为 ISA 兼容 |
+| ARM64 (典型) | 0~1GB | 1GB~4GB | 4GB+ | DMA 上界由 dma-ranges 决定 |
+| ARM64 (无DMA zone) | 无 | 0~4GB | 4GB+ | CONFIG_ZONE_DMA=n |
+| 32-bit ARM | 0~16MB | 无 | 16MB~760MB | 还有 ZONE_HIGHMEM |
+
+```bash
+# 查看当前系统 zone 划分:
+cat /proc/zoneinfo | grep -E "Node|zone |spanned|present"
 ```
 
 ```c
