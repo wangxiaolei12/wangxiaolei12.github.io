@@ -44,6 +44,14 @@ description: "Xiaolei Wang's blog about Linux kernel development, graphics progr
 </div>
 </a>
 
+<a href="/category/memory-subsystem/" style="text-decoration: none; color: inherit;">
+<div style="border: 1px solid #444; border-radius: 8px; padding: 1.5rem; transition: transform 0.2s;">
+<h2 style="margin-top: 0;">🧠 内存子系统</h2>
+<p>物理内存、虚拟内存、伙伴系统、SLUB、mmap、vmalloc</p>
+<p style="opacity: 0.6;">{{ site.posts | where_exp: "p", "p.path contains 'memory-subsystem/'" | size }} 篇文章</p>
+</div>
+</a>
+
 <a href="/category/networking/" style="text-decoration: none; color: inherit;">
 <div style="border: 1px solid #444; border-radius: 8px; padding: 1.5rem; transition: transform 0.2s;">
 <h2 style="margin-top: 0;">🌐 网络子系统</h2>
