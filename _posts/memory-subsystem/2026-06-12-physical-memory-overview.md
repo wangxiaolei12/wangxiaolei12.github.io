@@ -95,12 +95,34 @@ enum zone_type {
 
 **各架构 Zone 对比：**
 
-| 架构 | ZONE_DMA | ZONE_DMA32 | ZONE_NORMAL | 说明 |
-|------|----------|-----------|-------------|------|
-| x86_64 | 0~16MB | 16MB~4GB | 4GB+ | 三个都有，DMA 为 ISA 兼容 |
-| ARM64 (典型) | 0~1GB | 1GB~4GB | 4GB+ | DMA 上界由 dma-ranges 决定 |
-| ARM64 (无DMA zone) | 无 | 0~4GB | 4GB+ | CONFIG_ZONE_DMA=n |
-| 32-bit ARM | 0~16MB | 无 | 16MB~760MB | 还有 ZONE_HIGHMEM |
+| 架构 | ZONE_DMA | ZONE_DMA32 | ZONE_NORMAL | ZONE_HIGHMEM | 说明 |
+|------|----------|-----------|-------------|-------------|------|
+| x86_64 | 0~16MB | 16MB~4GB | 4GB+ | 无 | DMA 为 ISA 兼容 |
+| ARM64 (典型) | 0~1GB | 1GB~4GB | 4GB+ | 无 | DMA 上界由 dma-ranges 决定 |
+| ARM64 (无DMA) | 无 | 0~4GB | 4GB+ | 无 | CONFIG_ZONE_DMA=n |
+| x86_32 | 0~16MB | 无 | 16MB~896MB | 896MB+ | 超过直接映射范围 |
+| ARM32 | 0~16MB | 无 | 16MB~760MB | 760MB+ | 3G/1G 分割，内核只映射 ~760MB |
+
+**为什么 32 位有 HIGHMEM，64 位没有？**
+
+```
+32-bit (内核虚拟空间仅 ~1GB):
+┌─────────────────────────────────┐ 4GB
+│  用户空间 3GB                    │
+├─────────────────────────────────┤ 3GB (PAGE_OFFSET)
+│  内核线性映射 ~896MB             │ ← ZONE_DMA + ZONE_NORMAL 在这
+│  (virt = phys + PAGE_OFFSET)    │
+├─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┤ 3GB + 896MB
+│  vmalloc/fixmap/pkmap 128MB      │
+└─────────────────────────────────┘ 4GB
+
+物理内存 > 896MB 的部分 → ZONE_HIGHMEM
+  无法线性映射，必须用 kmap()/kmap_atomic() 临时映射到内核地址空间
+
+64-bit (内核虚拟空间 128TB+):
+  所有物理内存都能线性映射 → 不需要 HIGHMEM
+  kmap() 在 64-bit 上是空操作 (直接返回 page_address)
+```
 
 ```bash
 # 查看当前系统 zone 划分:
