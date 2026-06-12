@@ -335,3 +335,175 @@ spin_lock_bh(&lock) = spin_lock(&lock) + local_bh_disable()
 | softirq vs softirq (跨CPU) | `spin_lock` |
 | softirq vs 硬中断 | `spin_lock_irqsave` |
 | 同 CPU softirq 内部 | 无需锁（不会嵌套自身） |
+
+---
+
+## 十、Softirq vs Tasklet vs Workqueue 详解
+
+### 为什么 Softirq 可以多 CPU 并发？
+
+Softirq 的设计就是**无状态的全局函数**，没有任何"锁"阻止多 CPU 同时调用：
+
+```c
+// softirq 注册：一个函数指针，全局共享
+open_softirq(NET_RX_SOFTIRQ, net_rx_action);
+
+// 每个 CPU 独立的 pending 位图
+// CPU 0 和 CPU 1 可以同时 pending NET_RX_SOFTIRQ
+```
+
+执行时：
+```
+CPU 0: handle_softirqs()           CPU 1: handle_softirqs()
+         │                                   │
+         ▼                                   ▼
+    net_rx_action()  ← 同一个函数 →    net_rx_action()
+    处理 CPU0 的网卡队列              处理 CPU1 的网卡队列
+```
+
+**没有任何机制阻止并发**——这是刻意的设计，为了网络等高性能场景最大化吞吐。代价是 handler 内部必须自己处理同步（通常靠 per-CPU 数据避免锁）。
+
+### 为什么 Tasklet 不能多 CPU 并发？
+
+Tasklet 通过**两层原子标志位**强制串行化同一实例：
+
+```c
+struct tasklet_struct {
+    struct tasklet_struct *next;
+    unsigned long state;        // ← 关键：SCHED 和 RUN 标志
+    atomic_t count;
+    void (*callback)(struct tasklet_struct *);
+};
+```
+
+**第一层：调度时 — TASKLET_STATE_SCHED**
+```c
+static inline void tasklet_schedule(struct tasklet_struct *t)
+{
+    // 原子 test-and-set，只有一个 CPU 能成功
+    if (!test_and_set_bit(TASKLET_STATE_SCHED, &t->state))
+        __tasklet_schedule(t);   // 挂到当前 CPU 的链表
+    // 其他 CPU 调用时，bit 已经是 1，直接返回
+    // → 同一个 tasklet 只存在于一个 CPU 的链表中
+}
+```
+
+**第二层：执行时 — TASKLET_STATE_RUN**
+```c
+tasklet_action_common() {
+    while (list) {
+        struct tasklet_struct *t = list;
+
+        if (tasklet_trylock(t)) {       // 尝试设置 RUN bit
+            if (!atomic_read(&t->count)) {
+                tasklet_clear_sched(t);  // 清 SCHED bit
+                t->callback(t);          // ★ 执行
+            }
+            tasklet_unlock(t);           // 清 RUN bit
+        } else {
+            // 拿不到锁（另一个 CPU 在跑）→ 放回链表
+            *tl_head->tail = t;
+            raise_softirq_irqoff(softirq_nr);  // 下次再试
+        }
+    }
+}
+```
+
+**完整流程：为什么不能并发**
+```
+时间线:
+
+CPU 0                                    CPU 1
+─────                                    ─────
+tasklet_schedule(&my_tasklet)
+  test_and_set_bit(SCHED) → 成功(0→1)
+  挂到 CPU0 链表
+                                         tasklet_schedule(&my_tasklet)
+                                           test_and_set_bit(SCHED) → 失败(已经是1)
+                                           直接返回，不挂链表
+                                           ← my_tasklet 不在 CPU1 链表上
+
+softirq 触发:
+  tasklet_trylock() → 成功
+  my_tasklet->callback()  执行中...
+                                         即使 tasklet 被迁移过来:
+                                           tasklet_trylock() → 失败(RUN=1)
+                                           放回链表，等下次
+
+  callback 返回
+  tasklet_unlock()  清 RUN
+  tasklet_clear_sched()  清 SCHED
+                                         下次 softirq:
+                                           tasklet_trylock() → 成功
+                                           执行 callback
+```
+
+### 三者对比
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    Bottom Half 机制对比                                   │
+├──────────────┬──────────────────┬──────────────────┬────────────────────┤
+│              │    Softirq       │    Tasklet       │    Workqueue       │
+├──────────────┼──────────────────┼──────────────────┼────────────────────┤
+│ 执行上下文    │ 软中断上下文      │ 软中断上下文      │ 进程上下文(kworker)│
+├──────────────┼──────────────────┼──────────────────┼────────────────────┤
+│ 可以睡眠？    │ ❌ 不可          │ ❌ 不可          │ ✅ 可以            │
+├──────────────┼──────────────────┼──────────────────┼────────────────────┤
+│ 同实例并发？  │ ✅ 可以          │ ❌ 不可          │ ❌ 不可(同一work)  │
+│              │ (多CPU同时跑     │ (STATE_RUN 阻止) │ (WQ 保证串行)     │
+│              │  同一handler)    │                  │                    │
+├──────────────┼──────────────────┼──────────────────┼────────────────────┤
+│ 延迟         │ 最低(硬中断退出  │ 低(依附于softirq)│ 较高(需调度kworker)│
+│              │ 立即执行)        │                  │                    │
+├──────────────┼──────────────────┼──────────────────┼────────────────────┤
+│ 同步需求     │ handler 内部     │ 无需(框架保证    │ 无需(进程上下文    │
+│              │ 必须自己加锁     │ 串行化)          │ 可用 mutex)        │
+├──────────────┼──────────────────┼──────────────────┼────────────────────┤
+│ 数量限制     │ 编译时固定10个   │ 无限制           │ 无限制             │
+├──────────────┼──────────────────┼──────────────────┼────────────────────┤
+│ 新增方式     │ 修改内核源码     │ 动态创建         │ 动态创建           │
+│              │ open_softirq()   │ tasklet_setup()  │ INIT_WORK()        │
+├──────────────┼──────────────────┼──────────────────┼────────────────────┤
+│ 典型用户     │ 网络收发、定时器  │ 少量老驱动       │ 大多数驱动的       │
+│              │ 调度器、RCU      │ (新代码不建议用) │ 延迟工作           │
+├──────────────┼──────────────────┼──────────────────┼────────────────────┤
+│ 可被抢占？   │ ❌ (非RT)        │ ❌ (非RT)        │ ✅ 可以            │
+│              │ ✅ (PREEMPT_RT)  │ ✅ (PREEMPT_RT)  │                    │
+└──────────────┴──────────────────┴──────────────────┴────────────────────┘
+```
+
+### 如何选择？
+
+```
+需要延迟处理硬中断的工作？
+    │
+    ├── 需要睡眠（mutex、内存分配、I/O）？
+    │       └── Workqueue ✅
+    │
+    ├── 不需要睡眠，且是极高频路径（网络、块设备）？
+    │       └── Softirq ✅（但几乎不会新增，内核只有10个）
+    │
+    ├── 不需要睡眠，普通延迟处理？
+    │       └── Workqueue ✅（现代内核推荐）
+    │           或 threaded IRQ（request_threaded_irq）
+    │
+    └── Tasklet？→ 新代码不建议使用，正在被逐步移除
+```
+
+### Workqueue 本质区别
+
+```c
+// Workqueue 在 kworker 进程上下文执行
+static void my_work_handler(struct work_struct *work)
+{
+    mutex_lock(&my_mutex);     // ✅ 可以睡眠！
+    kmalloc(size, GFP_KERNEL); // ✅ 可以阻塞分配！
+    msleep(10);                // ✅ 可以延时！
+    mutex_unlock(&my_mutex);
+}
+
+// Softirq/Tasklet 中这些全部非法 ❌
+```
+
+Workqueue 通过 `kworker/N:M` 内核线程执行，有完整的进程上下文（内核栈、可调度、可睡眠），代价是调度延迟比 softirq 大。
