@@ -208,3 +208,130 @@ raise_softirq(nr)
 | `kernel/time/timer.c` | run_timer_softirq() |
 | `kernel/sched/fair.c` | run_rebalance_domains() |
 | `kernel/rcu/tree.c` | rcu_core_si() |
+
+---
+
+## 八、preempt_count — 内核上下文的统一标识
+
+`preempt_count` 是 `thread_info` 中的一个整数，**用一个变量同时追踪多种不可抢占的原因**：
+
+### 位布局
+
+```
+31          20  19          8  7           0
+┌────────────┬──────────────┬──────────────┐
+│  HARDIRQ   │   SOFTIRQ    │   PREEMPT    │
+│  count     │   count      │   count      │
+├────────────┼──────────────┼──────────────┤
+│  bit 16-19 │   bit 8-15   │   bit 0-7    │
+└────────────┴──────────────┴──────────────┘
+      ▲              ▲              ▲
+      │              │              │
+  irq_enter()   local_bh_      preempt_
+  irq_exit()    disable()      disable()
+```
+
+### 上下文判断宏
+
+```c
+#define in_interrupt()   (preempt_count() & (HARDIRQ_MASK | SOFTIRQ_MASK))
+#define in_hardirq()     (preempt_count() & HARDIRQ_MASK)
+#define in_softirq()     (preempt_count() & SOFTIRQ_MASK)
+#define in_task()        (!(preempt_count() & (HARDIRQ_MASK | SOFTIRQ_MASK | NMI_MASK)))
+#define preemptible()    (preempt_count() == 0 && !irqs_disabled())
+```
+
+### 各位段的含义
+
+| preempt_count 状态 | 含义 | 可抢占？ | 可睡眠？ |
+|---|---|---|---|
+| `== 0` | 普通进程上下文，无锁 | ✅ | ✅ |
+| PREEMPT 位非零 | 持有 spin_lock 或 preempt_disable | ❌ | ❌ |
+| SOFTIRQ 位非零 | 在 softirq 中或 local_bh_disable | ❌ | ❌ |
+| HARDIRQ 位非零 | 在硬中断处理中 | ❌ | ❌ |
+
+### 调度器如何使用
+
+从中断/异常返回内核态时，只有 `preempt_count == 0` 才会调用 `schedule()`。这是抢占式内核（`CONFIG_PREEMPT`）的核心：
+
+```c
+// 中断返回路径 (简化)
+if (need_resched() && preempt_count() == 0)
+    schedule();  // 允许抢占
+```
+
+---
+
+## 九、local_bh_disable / local_bh_enable 实现细节
+
+### local_bh_disable()
+
+```c
+// include/linux/bottom_half.h
+static inline void local_bh_disable(void)
+{
+    __local_bh_disable_ip(_THIS_IP_, SOFTIRQ_DISABLE_OFFSET);
+}
+
+// kernel/softirq.c (非 RT)
+void __local_bh_disable_ip(unsigned long ip, unsigned int cnt)
+{
+    // cnt = SOFTIRQ_DISABLE_OFFSET = 2 * SOFTIRQ_OFFSET
+    __preempt_count_add(cnt);   // 给 SOFTIRQ 位段加值
+
+    if (softirq_count() == (cnt & SOFTIRQ_MASK))
+        lockdep_softirqs_off(ip);  // 通知 lockdep
+}
+```
+
+**原理**：SOFTIRQ 位段非零 → `in_interrupt()` 为真 → `irq_exit()` 中的 `invoke_softirq()` 被跳过 → 软中断被推迟。
+
+### local_bh_enable()
+
+```c
+void __local_bh_enable_ip(unsigned long ip, unsigned int cnt)
+{
+    // 保持 preempt disabled 直到处理完 softirq
+    __preempt_count_sub(cnt - 1);
+
+    // 如果不在中断上下文且有 pending softirq，立即处理
+    if (unlikely(!in_interrupt() && local_softirq_pending()))
+        do_softirq();
+
+    preempt_count_dec();
+    preempt_check_resched();
+}
+```
+
+### 嵌套支持
+
+```c
+local_bh_disable();        // SOFTIRQ count: 2
+  local_bh_disable();      // SOFTIRQ count: 4 (可嵌套)
+  local_bh_enable();       // SOFTIRQ count: 2 (不触发 softirq)
+local_bh_enable();         // SOFTIRQ count: 0 → 检查并处理 pending
+```
+
+### 使用场景
+
+```c
+// 场景1: 进程上下文保护与 softirq 共享的数据
+local_bh_disable();
+/* 修改网络统计计数器，防止 NET_RX_SOFTIRQ 并发 */
+local_bh_enable();
+
+// 场景2: spin_lock_bh 的本质
+spin_lock_bh(&lock) = spin_lock(&lock) + local_bh_disable()
+// 同时防: 其他CPU竞争(spin_lock) + 本CPU softirq竞争(bh_disable)
+```
+
+### 锁选择指南
+
+| 竞争双方 | 所需保护 |
+|----------|----------|
+| 进程 vs 进程 | `spin_lock` |
+| 进程 vs softirq | `spin_lock_bh` |
+| 进程 vs 硬中断 | `spin_lock_irq` / `spin_lock_irqsave` |
+| softirq vs softirq (跨CPU) | `spin_lock` |
+| softirq vs 硬中断 | `spin_lock_irqsave` |
+| 同 CPU softirq 内部 | 无需锁（不会嵌套自身） |
