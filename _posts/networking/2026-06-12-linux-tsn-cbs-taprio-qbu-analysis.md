@@ -89,31 +89,65 @@ TSN (Time-Sensitive Networking) 是 IEEE 802.1 的一组标准，Linux 通过 **
 CBS 为时间敏感流量做**带宽整形**，防止突发占满链路。核心是**信用（credit）**机制：
 
 ```
-credit (字节)
+credit (bytes)
   ▲
-  │     hicredit ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
-  │    ╱         ╲
-  │   ╱ idleslope ╲ sendslope
-  │  ╱             ╲
-──┼─╱───────────────╲──────────────────→ 时间
-  │                   ╲
-  │                    ╲
-  │     locredit ─ ─ ─ ─╲─ ─ ─ ─ ─ ─
+  │  hicredit ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
+  │          ╱╲
+  │   等待  ╱  ╲  发送中
+  │  (涨) ╱    ╲  (credit 下降，包不会中断)
+  0 ─────╱──────╲──────────────────────────────── ← credit >= 0: 允许发下一个包
+  │              ╲         ╱
+  │               ╲ 等待  ╱
+  │    (禁止发送)  ╲     ╱ (以 idleslope 恢复)
+  │                 ╲   ╱
+  │  locredit ─ ─ ─ ─╲╱─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ← 发完一帧后的最大欠债
   │
-  发送时:  credit 按 sendslope 下降 (sendslope = idleslope - port_rate)
-  空闲时:  credit 按 idleslope 上升
-  credit >= 0: 允许发送
-  credit <  0: 等待，直到 credit 累积到 0
+  ├── 等待 ──┤├── 发 ──┤├──── 等待(credit<0) ────┤├── 发 ──┤
 ```
 
-### 四个参数
+**工作流程：**
+1. dequeue 时检查 credit >= 0 → 取包发送（整个包发完不会中断）
+2. 包发完后 credit 一次性扣减 → 可能变为负数（跌到 locredit 附近）
+3. credit < 0 → 禁止发下一个包，以 idleslope 速率恢复信用
+4. credit 恢复到 >= 0 → 允许发下一个包，回到第 1 步
+5. 如果队列空了（无包可发），credit 以 idleslope 上涨，但最多到 hicredit 封顶
 
-| 参数 | 含义 | 计算 |
-|------|------|------|
-| `idleslope` | 空闲时信用累积速率 (kbps) | 等于分配给该流的带宽 |
-| `sendslope` | 发送时信用消耗速率 (kbps) | `idleslope - port_rate` (负值) |
-| `hicredit` | 信用上限 (bytes) | `max_interference_size × (idleslope / port_rate)` |
-| `locredit` | 信用下限 (bytes) | `max_frame_size × (sendslope / port_rate)` |
+### 四个参数的计算
+
+| 参数 | 含义 | 公式 | 说明 |
+|------|------|------|------|
+| `idleslope` | 分配给该流的带宽 (kbps) | 直接指定 | 空闲/等待时 credit 恢复速率 |
+| `sendslope` | 发送时的净消耗速率 (kbps) | `idleslope - port_rate` | 一定是负数，因为发送占满整个链路 |
+| `hicredit` | 信用上限 (bytes) | `max_interference_size × (idleslope / port_rate)` | 等别人最大帧发完期间能攒多少信用 |
+| `locredit` | 信用下限 (bytes) | `max_frame_size × (sendslope / port_rate)` | 发完自己最大帧后最多欠多少（负值） |
+
+**参数含义详解：**
+
+- **port_rate**：网口物理链路速率（如 1Gbps = 1,000,000 kbps）
+- **max_interference_size**：**其他流量**能发的最大帧（你的包可能要等它发完），通常 = MTU 1500 或含头 1522
+- **max_frame_size**：**你这个 TC** 能发的最大帧
+
+**实例推导 (1Gbps 端口，分配 20Mbps)：**
+
+```
+port_rate = 1,000,000 kbps
+idleslope = 20,000 kbps (想分配 20Mbps)
+
+sendslope = 20,000 - 1,000,000 = -980,000 kbps
+  → 发送时每秒净消耗 980Mbps 的信用（因为占用 1G 链路但只配了 20M）
+
+hicredit = 1500 × (20,000 / 1,000,000) = 1500 × 0.02 = 30 bytes
+  → 等一个 1500B 干扰帧发完，期间以 2% 速率攒信用 = 最多攒 30B
+
+locredit = 1500 × (-980,000 / 1,000,000) = 1500 × (-0.98) = -1470 bytes
+  → 发完一个 1500B 帧，信用净消耗 = 1500 × 98% = 1470（2% 赚回来了）
+```
+
+**效果验证：**
+```
+发 1500B → credit 跌 1470 → 等待恢复到 0 需要 1470/2500 = 588μs
+平均速率 = 1500×8 / 588μs ≈ 20 Mbps ✓ 正好等于 idleslope
+```
 
 ### 内核实现 (net/sched/sch_cbs.c)
 
