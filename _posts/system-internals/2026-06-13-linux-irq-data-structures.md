@@ -2,394 +2,362 @@
 layout: post
 title: "Linux 中断子系统(1): 核心数据结构 — irq_desc、irq_domain、irq_chip、irqaction"
 date: 2026-06-13 08:30:00 +0800
-excerpt: "深入分析 Linux 中断子系统的核心数据结构及其关系：irq_desc 中断描述符、irq_data 中断数据、irq_chip 硬件抽象、irq_domain 中断域（hwirq→virq 映射）、irqaction 处理链。以 GICv3 为例。"
+excerpt: "用实际例子讲清楚 Linux 中断子系统四大核心结构的关系：irq_domain 是电话簿、irq_chip 是遥控器、irq_desc 是档案、irqaction 是该做什么。以 GICv3 + 网卡为例。"
 ---
 
 # Linux 中断子系统(1): 核心数据结构
 
 ---
 
-## 一、整体架构与数据结构关系
+## 一、先搞清楚要解决什么问题
+
+一个 SoC 上有很多中断控制器，每个控制器自己编号：
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  驱动 (request_irq)                                                          │
-│      │                                                                      │
-│      ▼                                                                      │
-│  ┌──────────────────────────────────────────────────────────────────────┐   │
-│  │  irq_desc [virq]                  每个 Linux 虚拟中断号一个           │   │
-│  │  ┌────────────────────────────────────────────────────────────┐      │   │
-│  │  │  irq_data                                                  │      │   │
-│  │  │  ├── irq (virq: Linux 虚拟中断号)                          │      │   │
-│  │  │  ├── hwirq (硬件中断号)                                    │      │   │
-│  │  │  ├── chip → struct irq_chip (硬件操作: mask/unmask/ack/eoi)│      │   │
-│  │  │  ├── domain → struct irq_domain (hwirq↔virq 映射)         │      │   │
-│  │  │  ├── chip_data (控制器私有数据)                            │      │   │
-│  │  │  └── parent_data → 上级 irq_data (级联/层次化)             │      │   │
-│  │  └────────────────────────────────────────────────────────────┘      │   │
-│  │  ├── handle_irq → 流控处理函数 (handle_fasteoi_irq 等)               │   │
-│  │  ├── action → struct irqaction 链表 (驱动注册的 handler)             │   │
-│  │  ├── depth (嵌套 disable 计数)                                       │   │
-│  │  └── lock                                                            │   │
-│  └──────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-│  ┌──────────────────────────────────────────────────────────────────────┐   │
-│  │  irq_domain (GIC domain)                                              │   │
-│  │  ├── ops: xlate/map/alloc/translate                                  │   │
-│  │  ├── parent → 上级 domain (层次化)                                    │   │
-│  │  ├── hwirq_max                                                       │   │
-│  │  └── revmap[]: hwirq → irq_data 反向映射表                           │   │
-│  └──────────────────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────────────────┘
+GPIO 控制器 A:  hwirq=5 (第5个引脚)
+GPIO 控制器 B:  hwirq=5 (也是第5个引脚)  ← 和上面重复！
+GIC:            hwirq=72 (SPI 72)
+GIC:            hwirq=5  (SGI 5)         ← 和 GPIO 也重复！
+```
+
+内核需要一个**全局唯一的编号 (virq)**，驱动用它 `request_irq()`，`/proc/interrupts` 显示它：
+
+```
+GPIO-A hwirq=5   →  virq=120
+GPIO-B hwirq=5   →  virq=145   ← 同样 hwirq=5 但不同 virq
+GIC    hwirq=72  →  virq=167
+GIC    hwirq=5   →  virq=5
 ```
 
 ---
 
-## 二、struct irq_desc — 中断描述符
+## 二、用一个真实例子讲清四个结构的关系
 
-**每个 Linux 虚拟中断号 (virq) 对应一个 `irq_desc`**，是中断子系统的核心：
-
-```c
-// include/linux/irqdesc.h
-struct irq_desc {
-    struct irq_common_data  irq_common_data;   // 共享数据 (affinity, node...)
-    struct irq_data         irq_data;          // ★ 中断数据 (chip/domain/hwirq)
-    struct irqstat __percpu *kstat_irqs;       // per-cpu 统计 (/proc/interrupts)
-    irq_flow_handler_t      handle_irq;        // ★ 流控 handler (高层处理)
-    struct irqaction        *action;           // ★ 驱动 handler 链表
-    unsigned int            status_use_accessors;
-    unsigned int            depth;             // disable 嵌套深度
-    unsigned int            irq_count;         // 检测 stalled irq
-    raw_spinlock_t          lock;              // SMP 保护
-    struct cpumask          *percpu_enabled;   // per-cpu 使能掩码
-    wait_queue_head_t       wait_for_threads;  // 等待 threaded handler
-    struct proc_dir_entry   *dir;              // /proc/irq/N/
-    const char              *name;             // 用于 /proc/interrupts
-};
-```
-
-### 存储方式
-
-```c
-// 两种模式:
-#ifdef CONFIG_SPARSE_IRQ  // 现代内核默认
-  // 动态分配，用 radix tree 管理
-  struct irq_desc *irq_to_desc(unsigned int irq);  // 查表
-#else
-  // 静态数组
-  struct irq_desc irq_desc[NR_IRQS];  // 编译时固定大小
-#endif
-```
-
----
-
-## 三、struct irq_data — 连接 desc/chip/domain
-
-```c
-// include/linux/irq.h
-struct irq_data {
-    u32                     mask;          // chip 内部用
-    unsigned int            irq;           // Linux 虚拟中断号 (virq)
-    irq_hw_number_t         hwirq;         // ★ 硬件中断号 (控制器看到的)
-    struct irq_common_data  *common;       // 指向 desc->irq_common_data
-    struct irq_chip         *chip;         // ★ 硬件操作集
-    struct irq_domain       *domain;       // ★ 所属中断域
-    struct irq_data         *parent_data;  // 级联: 上级控制器的 irq_data
-    void                    *chip_data;    // 控制器私有数据
-};
-```
-
-**关键理解：**
-- `irq` = virq = Linux 软件中断号，驱动用这个调用 `request_irq()`
-- `hwirq` = 硬件中断号，GIC 看到的 INTID（如 SPI 32）
-- 两者的映射由 `irq_domain` 管理
-
----
-
-## 四、struct irq_chip — 中断控制器硬件抽象
-
-每个中断控制器驱动实现一组硬件操作：
-
-```c
-// include/linux/irq.h
-struct irq_chip {
-    const char  *name;                          // "GICv3", "GPIO"...
-
-    /* 生命周期 */
-    unsigned int (*irq_startup)(struct irq_data *data);
-    void         (*irq_shutdown)(struct irq_data *data);
-    void         (*irq_enable)(struct irq_data *data);
-    void         (*irq_disable)(struct irq_data *data);
-
-    /* ★ 核心操作 */
-    void         (*irq_ack)(struct irq_data *data);      // 应答中断
-    void         (*irq_mask)(struct irq_data *data);     // 屏蔽中断
-    void         (*irq_unmask)(struct irq_data *data);   // 解除屏蔽
-    void         (*irq_eoi)(struct irq_data *data);      // End of Interrupt
-    void         (*irq_mask_ack)(struct irq_data *data); // mask + ack 原子操作
-
-    /* 配置 */
-    int          (*irq_set_affinity)(struct irq_data *data,
-                                     const struct cpumask *dest, bool force);
-    int          (*irq_set_type)(struct irq_data *data, unsigned int type);
-                                     // 设置触发类型: 边沿/电平/高/低
-    int          (*irq_set_wake)(struct irq_data *data, unsigned int on);
-                                     // 设为唤醒源
-
-    /* MSI */
-    void         (*irq_compose_msi_msg)(struct irq_data *data, struct msi_msg *msg);
-    void         (*irq_write_msi_msg)(struct irq_data *data, struct msi_msg *msg);
-
-    unsigned long flags;
-};
-```
-
-### GICv3 的 irq_chip 实现
-
-```c
-// drivers/irqchip/irq-gic-v3.c
-static struct irq_chip gic_chip = {
-    .name                   = "GICv3",
-    .irq_mask               = gic_mask_irq,       // 写 GICD_ICENABLER
-    .irq_unmask             = gic_unmask_irq,     // 写 GICD_ISENABLER
-    .irq_eoi                = gic_eoi_irq,        // 写 ICC_EOIR1_EL1
-    .irq_set_type           = gic_set_type,       // 写 GICD_ICFGR
-    .irq_set_affinity       = gic_set_affinity,   // 写 GICD_IROUTER
-    .irq_set_wake           = gic_set_wake,
-    .flags                  = IRQCHIP_SET_TYPE_MASKED |
-                              IRQCHIP_SKIP_SET_WAKE |
-                              IRQCHIP_MASK_ON_SUSPEND,
-};
-```
-
----
-
-## 五、struct irq_domain — 中断域（hwirq ↔ virq 映射）
-
-**解决的问题：** 硬件中断号 (hwirq) 是控制器本地的（GIC 的 SPI 32, GPIO 的 pin 5），但 Linux 需要全局唯一的虚拟中断号 (virq)。`irq_domain` 负责这个映射。
-
-```c
-// include/linux/irqdomain.h
-struct irq_domain {
-    const char                  *name;         // "GICv3", "pinctrl-gpio"
-    const struct irq_domain_ops *ops;          // ★ 映射操作
-    void                        *host_data;    // 控制器私有数据
-    unsigned int                flags;
-    struct irq_domain           *parent;       // ★ 层次化: 上级 domain
-    struct fwnode_handle        *fwnode;       // DT/ACPI 节点
-
-    /* 反向映射: hwirq → irq_data */
-    irq_hw_number_t             hwirq_max;
-    unsigned int                revmap_size;
-    struct radix_tree_root      revmap_tree;   // 大号 hwirq 用 radix tree
-    struct irq_data __rcu       *revmap[];     // 小号 hwirq 用线性数组
-};
-```
-
-### irq_domain_ops — 映射操作
-
-```c
-struct irq_domain_ops {
-    /* DT 解析: 从 DT interrupts 属性解析出 hwirq + type */
-    int (*xlate)(struct irq_domain *d, struct device_node *node,
-                 const u32 *intspec, unsigned int intsize,
-                 unsigned long *out_hwirq, unsigned int *out_type);
-
-    /* 建立映射: hwirq → virq (设置 irq_data, 关联 chip) */
-    int (*map)(struct irq_domain *d, unsigned int virq, irq_hw_number_t hw);
-
-    /* 层次化域的操作 */
-    int (*alloc)(struct irq_domain *d, unsigned int virq,
-                 unsigned int nr_irqs, void *arg);
-    void (*free)(struct irq_domain *d, unsigned int virq, unsigned int nr_irqs);
-    int (*translate)(struct irq_domain *d, struct irq_fwspec *fwspec,
-                     unsigned long *out_hwirq, unsigned int *out_type);
-};
-```
-
-### 层次化 irq_domain (Hierarchy)
-
-现代 SoC 中断经过多级控制器：
+**场景：网卡中断连到 GIC 的 SPI 72**
 
 ```
-设备中断 → GPIO 控制器 → GIC → CPU
-
-对应 domain 层次:
-┌─────────────────┐
-│  GPIO domain    │  hwirq = pin 5
-│  gpio_chip      │
-└────────┬────────┘
-         │ parent
-┌────────▼────────┐
-│  GIC domain     │  hwirq = SPI 72 (GPIO 连到 GIC 的 SPI 72)
-│  gic_chip       │
-└────────┬────────┘
-         │
-     CPU 收到中断
-
-irq_data 链:
-  irq_data (GPIO level): irq=167, hwirq=5, chip=gpio_chip, domain=gpio_domain
-      └── parent_data (GIC level): hwirq=72, chip=gic_chip, domain=gic_domain
+网卡 ───IRQ线───→ GIC (INTID 72) ───→ CPU
 ```
 
----
+### 四个角色，各管什么
 
-## 六、struct irqaction — 驱动处理函数
+| 结构 | 角色 | 比喻 |
+|------|------|------|
+| `irq_domain` | 管"硬件号→软件号"的映射 | **电话簿**：查名字找号码 |
+| `irq_chip` | 管"怎么操作硬件" | **遥控器**：mask/unmask/eoi 按钮 |
+| `irq_desc` | 一个中断的全部信息 | **档案**：谁的中断、怎么处理、谁来处理 |
+| `irqaction` | 驱动注册的处理函数 | **执行人**：中断来了该做什么 |
 
-驱动调用 `request_irq()` 注册的处理函数挂在这里：
-
-```c
-// include/linux/interrupt.h
-struct irqaction {
-    irq_handler_t       handler;        // ★ 硬中断 handler (top half)
-    void                *dev_id;        // 传给 handler 的参数 (区分共享中断)
-    struct irqaction    *next;          // ★ 链表: 共享中断支持多个 handler
-    irq_handler_t       thread_fn;      // ★ threaded handler (在内核线程执行)
-    struct task_struct  *thread;        // threaded handler 的内核线程
-    unsigned int        irq;            // 中断号
-    unsigned int        flags;          // IRQF_SHARED, IRQF_ONESHOT...
-    const char          *name;          // /proc/interrupts 中的名称
-};
-```
-
-### 共享中断 (IRQF_SHARED)
+### 谁创建谁？按时间顺序
 
 ```
-irq_desc[167].action → irqaction(eth0) → irqaction(usb) → NULL
-                       handler: e1000_intr  handler: usb_hcd_irq
-                       dev_id: netdev       dev_id: hcd
+═══════════════════════════════════════════════════════════
+ 第一步：GIC 驱动 probe (系统启动早期)
+═══════════════════════════════════════════════════════════
 
-中断来了 → 逐个调用 handler，由各自判断是不是自己的中断
-  if (handler(irq, dev_id) == IRQ_HANDLED) → 是我的
-  if (handler(irq, dev_id) == IRQ_NONE)    → 不是我的
+创建 irq_chip:
+  "我是 GIC，要 mask 中断写 GICD_ICENABLER 寄存器，
+   要 eoi 写 ICC_EOIR1_EL1 寄存器..."
+
+创建 irq_domain:
+  "我负责 hwirq 0~1019 的映射，
+   谁问我 hwirq 对应什么 virq，我给他分配一个"
+
+═══════════════════════════════════════════════════════════
+ 第二步：网卡驱动 probe (解析 DT: interrupts = <SPI 72 LEVEL>)
+═══════════════════════════════════════════════════════════
+
+platform_get_irq(pdev, 0):
+  → 问 GIC 的 irq_domain："hwirq=72 对应什么 virq？"
+  → domain 分配 virq=167
+  → 创建 irq_desc[167]，填好 irq_data:
+        .hwirq = 72
+        .chip = &gic_chip      (绑定遥控器)
+        .domain = &gic_domain  (记住电话簿)
+  → 返回 virq=167 给网卡驱动
+
+═══════════════════════════════════════════════════════════
+ 第三步：网卡驱动 request_irq(167, e1000_intr, ...)
+═══════════════════════════════════════════════════════════
+
+  → 创建 irqaction { handler=e1000_intr, name="eth0" }
+  → 挂到 irq_desc[167].action 链表
+  → 调 gic_chip.irq_unmask()：使能 GIC 的 hwirq 72
+  → 中断就绑了！
 ```
 
----
-
-## 七、流控 handler — handle_irq
-
-`irq_desc->handle_irq` 是高层流控函数，根据中断类型（电平/边沿）调用不同策略：
-
-```c
-// 常见的流控 handler:
-void handle_fasteoi_irq(struct irq_desc *desc);     // ★ GIC 最常用 (ack由硬件做)
-void handle_level_irq(struct irq_desc *desc);       // 电平触发
-void handle_edge_irq(struct irq_desc *desc);        // 边沿触发
-void handle_simple_irq(struct irq_desc *desc);      // 无需硬件操作
-void handle_percpu_devid_irq(struct irq_desc *desc); // per-CPU 中断
-```
-
-### handle_fasteoi_irq 流程（GIC 使用）
-
-```c
-void handle_fasteoi_irq(struct irq_desc *desc)
-{
-    struct irq_chip *chip = desc->irq_data.chip;
-
-    raw_spin_lock(&desc->lock);
-
-    // 遍历 action 链表，调用每个 handler
-    handle_irq_event(desc);
-    //   → for each action:
-    //       ret = action->handler(irq, action->dev_id);
-    //       if (ret == IRQ_WAKE_THREAD)
-    //           wake_up_process(action->thread);  // 唤醒 threaded handler
-
-    // 发 EOI 给 GIC
-    chip->irq_eoi(&desc->irq_data);
-
-    raw_spin_unlock(&desc->lock);
-}
-```
-
----
-
-## 八、数据结构关系全景图
+### 中断来了怎么查？一路追踪
 
 ```
-/proc/interrupts 中一行:
- 167:    1234    0    0    GICv3  72 Level  eth0, usb
+网卡产生中断 → GIC 给 CPU：hwirq=72
+    │
+    │ "hwirq=72 对应哪个 irq_desc？问电话簿"
+    ▼
+irq_domain.revmap[72] ──→ 找到 irq_desc[167]
+    │
+    │ "找到档案了，怎么处理？看档案上写的流程"
+    ▼
+irq_desc[167].handle_irq ──→ handle_fasteoi_irq()
+    │
+    │ "要操作硬件（eoi），用什么遥控器？"
+    ▼
+irq_desc[167].irq_data.chip ──→ gic_chip.irq_eoi()
+    │
+    │ "要通知驱动，谁是执行人？"
+    ▼
+irq_desc[167].action ──→ e1000_intr(167, dev)
+```
 
-对应内核结构:
-┌─────────────────────────────────────────────────────────────────┐
-│ irq_desc[167]                                                    │
-│                                                                  │
-│  irq_data:                                                       │
-│    irq = 167 (virq)          ←── /proc 中的中断号               │
-│    hwirq = 72 (SPI 72)      ←── GIC 看到的硬件号               │
-│    chip = &gic_chip          ←── "GICv3"                        │
-│    domain = gic_domain       ←── hwirq↔virq 映射              │
-│                                                                  │
-│  handle_irq = handle_fasteoi_irq  ←── "Level" 触发用 fasteoi    │
-│                                                                  │
-│  action → irqaction {                                            │
-│             handler = e1000_intr    ←── "eth0"                  │
-│             name = "eth0"                                        │
-│             next → irqaction {                                   │
-│                      handler = usb_hcd_irq  ←── "usb"          │
-│                      name = "usb"                                │
-│                      next = NULL                                 │
-│                    }                                              │
-│           }                                                      │
+### 一张图：谁指向谁
+
+```
+         irq_domain (GIC)
+         ┌───────────────────────┐
+         │ name = "GICv3"        │
+         │ revmap[72] ─────────────────┐
+         │ ops = gic_domain_ops  │     │
+         └───────────────────────┘     │
+                                       │ 指向
+              irq_chip (GIC)           │
+              ┌──────────────────┐     │
+              │ name = "GICv3"   │     │
+              │ irq_mask = ...   │     │
+              │ irq_unmask = ... │     │
+              │ irq_eoi = ...    │     │
+              └──────────────────┘     │
+                  ▲   ▲                │
+                  │   │                ▼
+┌─────────────────┼───┼───── irq_desc[167] ──────────────────────┐
+│                 │   │                                           │
+│  irq_data:     │   │                                           │
+│    .irq = 167 (virq)                                           │
+│    .hwirq = 72                                                 │
+│    .chip ───────┘   │                                           │
+│    .domain ─────────│──→ gic_domain                            │
+│                     │                                           │
+│  handle_irq ──→ handle_fasteoi_irq                             │
+│                                                                 │
+│  action ──→ irqaction ──→ irqaction ──→ NULL                   │
+│              │              │                                   │
+│              │ handler=     │ handler=                          │
+│              │ e1000_intr   │ usb_irq   (共享中断可多个)        │
+│              │ name="eth0"  │ name="usb"                       │
+│              │ dev_id=net   │ dev_id=hcd                       │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 九、hwirq → virq 映射建立过程
+## 三、struct irq_desc — 中断的"档案"
 
+```c
+struct irq_desc {
+    struct irq_data      irq_data;       // ★ 粘合剂：连接 chip + domain + hwirq
+    irq_flow_handler_t   handle_irq;     // ★ 流控函数：这类中断怎么处理
+    struct irqaction     *action;        // ★ 驱动 handler 链表
+    unsigned int         depth;          // disable 嵌套计数
+    raw_spinlock_t       lock;           // 保护
+    const char           *name;          // /proc/interrupts 中显示
+    struct irqstat __percpu *kstat_irqs; // 统计
+};
 ```
-设备树:
-  ethernet {
-      interrupts = <GIC_SPI 72 IRQ_TYPE_LEVEL_HIGH>;
-  };
 
-内核启动/设备 probe:
-  platform_get_irq(pdev, 0)
-      → of_irq_get(node, 0)
-          → irq_create_fwspec_mapping(&fwspec)
-              │
-              ├── irq_domain_translate(gic_domain, fwspec)
-              │       → gic_irq_domain_translate()
-              │         解析 DT: type=SPI, hwirq=72, trigger=LEVEL_HIGH
-              │
-              ├── irq_domain_alloc_irqs(gic_domain, 1, ...)
-              │       → __irq_domain_alloc_irqs()
-              │           ├── irq_domain_alloc_descs()
-              │           │     分配 virq=167, 创建 irq_desc[167]
-              │           │
-              │           └── gic_domain->ops->alloc()
-              │                 → gic_irq_domain_alloc()
-              │                   ├── irq_data->hwirq = 72
-              │                   ├── irq_data->chip = &gic_chip
-              │                   └── irq_set_handler(167, handle_fasteoi_irq)
-              │
-              └── 返回 virq = 167
-
-驱动:
-  int irq = platform_get_irq(pdev, 0);  // 得到 167
-  request_irq(irq, my_handler, IRQF_SHARED, "eth0", dev);
-      → 创建 irqaction，挂到 irq_desc[167]->action 链表
+存储方式：
+```c
+#ifdef CONFIG_SPARSE_IRQ   // 现代内核默认
+  // 动态分配，按需创建（platform_get_irq 时）
+  struct irq_desc *irq_to_desc(unsigned int irq); // radix tree 查找
+#else
+  // 静态数组，编译时固定
+  struct irq_desc irq_desc[NR_IRQS];
+#endif
 ```
 
 ---
 
-## 十、关键 API 总结
+## 四、struct irq_data — 粘合剂
 
-| API | 作用 |
-|-----|------|
-| `request_irq(irq, handler, flags, name, dev)` | 注册中断 handler |
-| `request_threaded_irq(irq, handler, thread_fn, ...)` | 注册 threaded handler |
-| `free_irq(irq, dev_id)` | 注销中断 |
-| `irq_domain_create_linear(fwnode, size, ops, data)` | 创建线性映射 domain |
-| `irq_domain_create_hierarchy(parent, flags, size, ...)` | 创建层次化 domain |
-| `irq_create_fwspec_mapping(fwspec)` | 从 DT/ACPI 建立 hwirq→virq |
-| `irq_set_chip_and_handler(virq, chip, handler)` | 设置 chip 和流控函数 |
-| `generic_handle_domain_irq(domain, hwirq)` | 中断到来时分发 |
+住在 `irq_desc` 里面，把所有东西连在一起：
+
+```c
+struct irq_data {
+    unsigned int         irq;          // virq (Linux 全局唯一中断号)
+    irq_hw_number_t      hwirq;        // 硬件中断号 (控制器本地的)
+    struct irq_chip      *chip;        // → 遥控器 (操作硬件的方法)
+    struct irq_domain    *domain;      // → 电话簿 (管映射的)
+    void                 *chip_data;   // 控制器私有数据
+    struct irq_data      *parent_data; // 级联：上级控制器的 irq_data
+};
+```
+
+**为什么不直接把这些字段放 irq_desc 里？**
+因为层次化中断（GPIO→GIC）每一级都需要自己的 chip/hwirq，`irq_data` 通过 `parent_data` 链起来：
+
+```
+设备 → GPIO 控制器 (pin 5) → GIC (SPI 72) → CPU
+
+irq_desc[167]:
+  irq_data (GPIO 级):
+    hwirq = 5, chip = gpio_chip, domain = gpio_domain
+    └── parent_data (GIC 级):
+          hwirq = 72, chip = gic_chip, domain = gic_domain
+```
 
 ---
 
-## 十一、源文件索引
+## 五、struct irq_chip — 遥控器
+
+每个中断控制器驱动提供一组操作硬件的方法：
+
+```c
+struct irq_chip {
+    const char *name;                    // "GICv3", "gpio-mxc"
+
+    // ★ 核心操作（每个都是写寄存器）
+    void (*irq_mask)(struct irq_data *);    // 屏蔽：不让这个中断到 CPU
+    void (*irq_unmask)(struct irq_data *);  // 解除屏蔽：允许到 CPU
+    void (*irq_ack)(struct irq_data *);     // 应答：告诉控制器"我收到了"
+    void (*irq_eoi)(struct irq_data *);     // End of Interrupt："我处理完了"
+
+    // 配置
+    int (*irq_set_type)(struct irq_data *, unsigned int type);
+        // 设置触发方式：上升沿/下降沿/高电平/低电平
+    int (*irq_set_affinity)(struct irq_data *, const struct cpumask *, bool);
+        // 设置哪个 CPU 响应这个中断
+    int (*irq_set_wake)(struct irq_data *, unsigned int on);
+        // 设为唤醒源（suspend 时能唤醒系统）
+};
+```
+
+**GICv3 的实现：**
+```c
+static struct irq_chip gic_chip = {
+    .name           = "GICv3",
+    .irq_mask       = gic_mask_irq,      // 写 GICD_ICENABLER[n]
+    .irq_unmask     = gic_unmask_irq,    // 写 GICD_ISENABLER[n]
+    .irq_eoi        = gic_eoi_irq,       // 写 ICC_EOIR1_EL1
+    .irq_set_type   = gic_set_type,      // 写 GICD_ICFGR[n]
+    .irq_set_affinity = gic_set_affinity, // 写 GICD_IROUTER[n]
+};
+```
+
+---
+
+## 六、struct irq_domain — 电话簿
+
+管理 "hwirq ↔ virq" 映射，每个中断控制器有自己的 domain：
+
+```c
+struct irq_domain {
+    const char              *name;       // "GICv3"
+    const struct irq_domain_ops *ops;    // 映射操作
+    void                    *host_data;  // 控制器私有数据 (如 gic_data)
+    struct irq_domain       *parent;     // 上级 domain (层次化)
+
+    // ★ 反向映射表：给一个 hwirq，快速找到对应的 irq_data
+    irq_hw_number_t         hwirq_max;
+    unsigned int            revmap_size;
+    struct irq_data __rcu   *revmap[];   // 线性数组: revmap[hwirq] → irq_data
+};
+```
+
+### irq_domain_ops — domain 怎么工作
+
+```c
+struct irq_domain_ops {
+    // 从设备树解析出 hwirq 和触发类型
+    int (*xlate)(struct irq_domain *d, struct device_node *node,
+                 const u32 *intspec, unsigned int intsize,
+                 unsigned long *out_hwirq, unsigned int *out_type);
+    // 举例: interrupts = <GIC_SPI 72 IRQ_TYPE_LEVEL_HIGH>
+    //       → out_hwirq=72, out_type=LEVEL_HIGH
+
+    // 建立映射：给 virq 关联 chip 和 handler
+    int (*map)(struct irq_domain *d, unsigned int virq, irq_hw_number_t hw);
+
+    // 层次化 domain 用的：分配 + 向上级 domain 传播
+    int (*alloc)(struct irq_domain *d, unsigned int virq,
+                 unsigned int nr_irqs, void *arg);
+};
+```
+
+---
+
+## 七、struct irqaction — 执行人
+
+驱动调 `request_irq()` 时创建，挂在 `irq_desc->action` 链表上：
+
+```c
+struct irqaction {
+    irq_handler_t    handler;      // ★ 硬中断 handler (top half, 不可睡眠)
+    irq_handler_t    thread_fn;    // ★ threaded handler (可睡眠)
+    void             *dev_id;      // 设备标识 (共享中断时区分是谁的)
+    struct irqaction *next;        // 链表：共享中断多个 handler
+    unsigned int     irq;          // virq
+    unsigned int     flags;        // IRQF_SHARED, IRQF_ONESHOT...
+    const char       *name;        // /proc/interrupts 中显示的名字
+    struct task_struct *thread;    // threaded handler 的内核线程
+};
+```
+
+### 共享中断（多个设备共用一条中断线）
+
+```
+irq_desc[167].action:
+  ┌──────────────┐     ┌──────────────┐
+  │ irqaction    │────→│ irqaction    │────→ NULL
+  │ handler=     │     │ handler=     │
+  │  e1000_intr  │     │  usb_hcd_irq │
+  │ name="eth0"  │     │ name="usb"   │
+  │ dev_id=net   │     │ dev_id=hcd   │
+  └──────────────┘     └──────────────┘
+
+中断来了 → 逐个调用：
+  ret = e1000_intr(167, net);   // "是我的" → IRQ_HANDLED
+  ret = usb_hcd_irq(167, hcd);  // "不是我的" → IRQ_NONE
+```
+
+---
+
+## 八、流控 handler — handle_irq
+
+`irq_desc->handle_irq` 定义了"这类中断的处理套路"：
+
+| handler | 适用场景 | 流程 |
+|---------|---------|------|
+| `handle_fasteoi_irq` | GIC 等现代控制器 | 调 action → eoi |
+| `handle_level_irq` | 电平触发 | mask → 调 action → unmask |
+| `handle_edge_irq` | 边沿触发 | ack → 调 action → (可能重触发) |
+| `handle_percpu_devid_irq` | per-CPU 中断 (PPI) | ack → 调 action → eoi |
+
+**handle_fasteoi_irq（GIC 最常用）做了什么：**
+```
+1. 锁 desc->lock
+2. 调用所有 action->handler()（驱动处理）
+3. chip->irq_eoi()（告诉 GIC "处理完了"）
+4. 解锁
+```
+
+---
+
+## 九、/proc/interrupts 每一列对应什么
+
+```
+           CPU0  CPU1  CPU2  CPU3   控制器   hwirq  触发   名称
+ 167:      1234     0     0     0   GICv3     72   Level  eth0, usb
+
+对应结构:
+  "167"     = irq_desc.irq_data.irq (virq)
+  "1234"    = irq_desc.kstat_irqs[cpu0]
+  "GICv3"   = irq_desc.irq_data.chip->name
+  "72"      = irq_desc.irq_data.hwirq
+  "Level"   = 触发类型 (irq_set_type 设置的)
+  "eth0,usb"= action->name 链表中所有的 name
+```
+
+---
+
+## 十、源文件索引
 
 | 文件 | 内容 |
 |------|------|
@@ -397,9 +365,8 @@ void handle_fasteoi_irq(struct irq_desc *desc)
 | `include/linux/irq.h` | struct irq_data, struct irq_chip |
 | `include/linux/irqdomain.h` | struct irq_domain, irq_domain_ops |
 | `include/linux/interrupt.h` | struct irqaction, request_irq API |
-| `kernel/irq/irqdesc.c` | irq_desc 分配/管理 |
-| `kernel/irq/irqdomain.c` | domain 创建/映射/层次化 |
-| `kernel/irq/chip.c` | handle_fasteoi_irq, handle_level_irq 等 |
-| `kernel/irq/manage.c` | request_irq/free_irq 实现 |
-| `kernel/irq/handle.c` | generic_handle_irq, handle_irq_event |
-| `drivers/irqchip/irq-gic-v3.c` | GICv3 驱动 (irq_chip + domain) |
+| `kernel/irq/irqdesc.c` | irq_desc 分配管理 |
+| `kernel/irq/irqdomain.c` | domain 创建、映射、revmap |
+| `kernel/irq/chip.c` | handle_fasteoi_irq 等流控函数 |
+| `kernel/irq/manage.c` | request_irq/free_irq |
+| `drivers/irqchip/irq-gic-v3.c` | GICv3 chip + domain 实现 |

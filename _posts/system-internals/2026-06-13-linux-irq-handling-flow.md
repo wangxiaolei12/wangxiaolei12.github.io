@@ -2,355 +2,339 @@
 layout: post
 title: "Linux 中断子系统(2): 中断处理流程 — 从硬件触发到驱动 Handler"
 date: 2026-06-13 08:31:00 +0800
-excerpt: "Linux 中断的完整处理流程：ARM64 异常向量入口、GIC IAR 读取、irq_desc 分发、流控 handler、驱动 handler 执行、threaded IRQ、softirq 触发。逐函数分析。"
+excerpt: "一个中断从硬件触发到驱动 handler 执行的完整路径：ARM64 异常入口→GIC 读 IAR→domain 查找→流控处理→驱动 handler→threaded IRQ。逐步骤带代码。"
 ---
 
 # Linux 中断子系统(2): 中断处理流程
 
 ---
 
-## 一、完整调用链概览
+## 一、一句话概览
 
 ```
-硬件设备产生中断信号
-    │
-    ▼
-GIC 接收，写入 pending 寄存器
-    │
-    ▼ (IRQ 信号送达 CPU)
-CPU 跳转到异常向量表
-    │
-    ▼
-el1_irq / el0_irq (arch/arm64/kernel/entry.S)
-    │
-    ▼
-gic_handle_irq()                    [drivers/irqchip/irq-gic-v3.c]
-    ├── 读 ICC_IAR1_EL1 → 获取 hwirq (INTID)
-    ├── 如果是 IPI (hwirq < 16) → 处理核间中断
-    └── generic_handle_domain_irq(gic_domain, hwirq)
-            │
-            ▼
-    irq_desc = irq_resolve_mapping(domain, hwirq)
-            │  通过 domain 的 revmap 找到 virq → irq_desc
-            ▼
-    generic_handle_irq_desc(desc)
-            │
-            ▼
-    desc->handle_irq(desc)          ← 流控 handler
-            │
-            ├── handle_fasteoi_irq(desc)
-            │       │
-            │       ├── handle_irq_event(desc)
-            │       │       │
-            │       │       └── handle_irq_event_percpu(desc)
-            │       │               │
-            │       │               └── for each action:
-            │       │                       action->handler(irq, dev_id)
-            │       │                       ├── IRQ_HANDLED → 完成
-            │       │                       ├── IRQ_WAKE_THREAD → 唤醒线程
-            │       │                       └── IRQ_NONE → 试下一个 (共享)
-            │       │
-            │       └── chip->irq_eoi(&desc->irq_data)
-            │               └── 写 ICC_EOIR1_EL1 (End of Interrupt)
-            │
-            └── 返回
-
-el1_irq 返回:
-    → irq_exit() → 检查 softirq pending → invoke_softirq()
+网卡拉高中断线 → GIC 通知 CPU → CPU 跳到异常入口 → 读 GIC 得到 hwirq
+→ 查电话簿(domain)得到 virq → 找到 irq_desc → 调流控函数 → 调驱动 handler
+→ 写 EOI 告诉 GIC "处理完了"
 ```
 
 ---
 
-## 二、ARM64 异常向量入口
+## 二、逐步骤详解
+
+### 步骤 1: 硬件 → CPU
 
 ```
+网卡完成收包 → 拉高 IRQ 线 → GIC 收到
+    │
+    ▼
+GIC 内部:
+  ├── 记录 INTID=72 到 pending 寄存器
+  ├── 判断优先级，选择目标 CPU
+  └── 向 CPU 发 IRQ 信号 (nIRQ 引脚拉低)
+    │
+    ▼
+CPU 检测到 IRQ:
+  ├── 完成当前指令
+  ├── 保存 PC 到 ELR_EL1
+  ├── 保存 PSTATE 到 SPSR_EL1
+  ├── 跳转到 VBAR_EL1 + offset (异常向量)
+```
+
+### 步骤 2: ARM64 异常向量入口
+
+```c
 // arch/arm64/kernel/entry.S
 
-// 异常向量表 (VBAR_EL1 指向这里):
-SYM_CODE_START(vectors)
-    // 从 EL1 (内核态) 进来的 IRQ:
-    kernel_ventry  el1t_64_irq          // SP_EL0
-    kernel_ventry  el1h_64_irq          // SP_EL1 ← 最常见
-
-    // 从 EL0 (用户态) 进来的 IRQ:
-    kernel_ventry  el0t_64_irq          // AArch64 用户态
-    kernel_ventry  el0t_32_irq          // AArch32 用户态
-SYM_CODE_END(vectors)
-
-// el1h_64_irq 处理:
+// CPU 跳到这里 (从内核态 EL1 来的 IRQ):
 el1h_64_irq:
-    kernel_entry 1                      // 保存寄存器到栈 (pt_regs)
-    el1_interrupt_handler handle_arch_irq  // 调用 C 函数
-    kernel_exit 1                       // 恢复寄存器，eret 返回
-
-// handle_arch_irq 指向 gic_handle_irq (GIC 驱动注册)
+    kernel_entry 1              // 把所有寄存器存到栈上 (pt_regs)
+    call handle_arch_irq        // → gic_handle_irq (GIC 驱动注册的)
+    kernel_exit 1               // 恢复寄存器，eret 返回被打断的地方
 ```
 
----
-
-## 三、GIC 中断入口 — gic_handle_irq
+### 步骤 3: GIC 驱动 — 读硬件中断号
 
 ```c
 // drivers/irqchip/irq-gic-v3.c
-static void __exception_irq_entry gic_handle_irq(struct pt_regs *regs)
+static void gic_handle_irq(struct pt_regs *regs)
 {
     u32 irqnr;
 
-    irqnr = gic_read_iar();  // ★ 读 ICC_IAR1_EL1，获取硬件中断号
+    // ★ 读 ICC_IAR1_EL1 寄存器 → 拿到硬件中断号
+    irqnr = gic_read_iar();  // 返回 72 (SPI 72)
 
-    if (likely(irqnr > 15 && irqnr < 1020)) {
-        // 普通外设中断 (SPI/PPI)
-        if (generic_handle_domain_irq(gic_data.domain, irqnr))
-            WARN_ONCE(...);  // 未映射的中断
-        return;
+    // 读 IAR 同时做了两件事:
+    //   1. 告诉 GIC "我知道了"(相当于 ack)
+    //   2. GIC 将此中断从 pending 变为 active
+
+    if (irqnr > 15 && irqnr < 1020) {
+        // 普通外设中断 → 去查映射
+        generic_handle_domain_irq(gic_data.domain, irqnr);
     }
-
-    if (irqnr < 16) {
-        // IPI (SGI, 0~15)
-        gic_handle_irq_ipi(irqnr, regs);
-        return;
+    else if (irqnr < 16) {
+        // IPI (核间中断，0~15)
+        gic_handle_ipi(irqnr, regs);
     }
-
-    // 1023 = spurious interrupt
-    gic_write_eoir(irqnr);  // 直接 EOI
+    // irqnr=1023: spurious，忽略
 }
 ```
 
----
-
-## 四、Domain 查找 — hwirq 到 virq
+### 步骤 4: 查电话簿 — hwirq 找到 virq
 
 ```c
 // kernel/irq/irqdomain.c
 int generic_handle_domain_irq(struct irq_domain *domain, irq_hw_number_t hwirq)
 {
+    // ★ 在 domain 的 revmap 里查找: hwirq=72 → irq_desc 是哪个？
     struct irq_desc *desc = irq_resolve_mapping(domain, hwirq);
+    //   内部: return domain->revmap[72] → irq_data → irq_desc[167]
+
     if (!desc)
-        return -EINVAL;
+        return -EINVAL;  // 未映射的中断
+
+    // 找到了，开始处理
     generic_handle_irq_desc(desc);
+    //   内部就是: desc->handle_irq(desc);
     return 0;
-}
-
-// 查找 revmap:
-static struct irq_desc *irq_resolve_mapping(struct irq_domain *domain,
-                                            irq_hw_number_t hwirq)
-{
-    struct irq_data *data;
-
-    // 线性映射 (hwirq < revmap_size): O(1) 数组直接索引
-    if (hwirq < domain->revmap_size)
-        data = rcu_dereference(domain->revmap[hwirq]);
-    else
-        // 大号 hwirq: radix tree 查找
-        data = radix_tree_lookup(&domain->revmap_tree, hwirq);
-
-    return data ? irq_data_to_desc(data) : NULL;
 }
 ```
 
----
-
-## 五、流控 Handler — handle_fasteoi_irq
-
-GIC 使用 fasteoi 模式（硬件自动 ack，软件只需 eoi）：
+### 步骤 5: 流控 handler — handle_fasteoi_irq
 
 ```c
 // kernel/irq/chip.c
 void handle_fasteoi_irq(struct irq_desc *desc)
 {
-    struct irq_chip *chip = desc->irq_data.chip;
-
     raw_spin_lock(&desc->lock);
 
-    if (!irq_may_run(desc))         // 检查中断是否被 disable
-        goto out;
-
-    desc->istate &= ~(IRQS_REPLAY | IRQS_WAITING);
-
-    if (unlikely(!desc->action || irqd_irq_disabled(&desc->irq_data))) {
-        desc->istate |= IRQS_PENDING;
-        mask_irq(desc);             // mask 掉避免反复触发
+    // 检查中断是否被 disable 了
+    if (unlikely(irqd_irq_disabled(&desc->irq_data))) {
+        mask_irq(desc);
         goto out;
     }
 
-    // ★ 执行所有注册的 handler
-    if (desc->istate & IRQS_ONESHOT)
-        mask_irq(desc);
-
+    // ★ 调用驱动注册的 handler(s)
     handle_irq_event(desc);
 
-out_eoi:
-    // ★ 写 EOI 通知 GIC 中断处理完毕
-    chip->irq_eoi(&desc->irq_data);
+    // ★ 写 EOI 告诉 GIC "我处理完了"
+    desc->irq_data.chip->irq_eoi(&desc->irq_data);
+    //   → gic_eoi_irq() → 写 ICC_EOIR1_EL1 = 72
+    //   → GIC 将中断从 active 变为 idle，可以再次触发
 
-out_unlock:
+out:
     raw_spin_unlock(&desc->lock);
 }
 ```
 
-### handle_irq_event — 调用驱动 handler
+### 步骤 6: 调用驱动 handler
 
 ```c
 // kernel/irq/handle.c
-irqreturn_t handle_irq_event_percpu(struct irq_desc *desc)
+irqreturn_t handle_irq_event(struct irq_desc *desc)
 {
     struct irqaction *action = desc->action;
-    irqreturn_t retval = IRQ_NONE;
 
-    // ★ 遍历 action 链表（共享中断有多个）
+    // ★ 遍历 action 链表，逐个调用
     for_each_action_of_desc(desc, action) {
         irqreturn_t res;
 
+        // 调用驱动的 handler
         res = action->handler(desc->irq_data.irq, action->dev_id);
-        //    ^^^^^^^^^^^^^^^^ 驱动注册的 handler
+        //    例如: e1000_intr(167, netdev)
 
         switch (res) {
-        case IRQ_HANDLED:
-            retval |= IRQ_HANDLED;
+        case IRQ_HANDLED:       // "是我的中断，处理完了"
             break;
-        case IRQ_WAKE_THREAD:
-            // 唤醒 threaded handler 内核线程
-            irq_wake_thread(desc, action);
-            retval |= IRQ_WAKE_THREAD;
+        case IRQ_WAKE_THREAD:   // "是我的，但要在线程里继续处理"
+            wake_up_process(action->thread);
             break;
-        case IRQ_NONE:
-            break;  // 不是这个设备的中断
+        case IRQ_NONE:          // "不是我的中断"(共享中断时)
+            break;
         }
     }
-    return retval;
 }
+```
+
+### 步骤 7: 返回
+
+```
+handle_fasteoi_irq 返回
+    → gic_handle_irq 返回
+        → el1h_64_irq:
+            kernel_exit:
+              irq_exit()
+                → 检查 softirq pending → 如有则 invoke_softirq()
+              恢复 pt_regs
+              eret → 回到被中断打断的地方继续执行
 ```
 
 ---
 
-## 六、Threaded IRQ — 中断线程化
+## 三、完整调用栈（从底到顶）
+
+```
+e1000_intr()                          ← 驱动 handler
+handle_irq_event()                    ← 遍历 action 链表
+handle_fasteoi_irq()                  ← 流控 (desc->handle_irq)
+generic_handle_irq_desc()             ← 调 handle_irq
+generic_handle_domain_irq()           ← domain revmap 查找
+gic_handle_irq()                      ← 读 IAR 获取 hwirq
+el1h_64_irq (entry.S)                ← ARM64 异常向量
+────── 硬件 ──────
+CPU 收到 IRQ 信号 (GIC → nIRQ)
+GIC 收到设备中断 (SPI 72)
+网卡拉高中断线
+```
+
+---
+
+## 四、Threaded IRQ — 线程化中断
+
+有些驱动中断处理需要睡眠（I2C/SPI 通信），不能在硬中断上下文做。用 threaded IRQ：
 
 ```c
 // 驱动注册:
-request_threaded_irq(irq, my_hardirq, my_thread_fn, IRQF_ONESHOT, "dev", dev);
-
-// my_hardirq (硬中断上下文):
-//   快速检查是否是自己的中断
-//   返回 IRQ_WAKE_THREAD → 唤醒线程处理
-
-// my_thread_fn (进程上下文, 可睡眠):
-//   执行耗时操作: I2C/SPI 通信, 内存分配...
+request_threaded_irq(irq,
+    my_hardirq,     // top half: 快速判断 + 返回 IRQ_WAKE_THREAD
+    my_thread_fn,   // bottom half: 在内核线程中执行，可以睡眠
+    IRQF_ONESHOT,   // 处理完线程前不要 unmask
+    "my_dev", dev);
 ```
 
-### 线程化处理流程
+### 执行流程
 
 ```
-硬中断:
+硬中断上下文 (不可睡眠):
   handle_fasteoi_irq()
-    → action->handler() returns IRQ_WAKE_THREAD
-    → irq_wake_thread(desc, action)
-        → wake_up_process(action->thread)  // 唤醒 irq/N-name 内核线程
-    → chip->irq_eoi()  // EOI，但中断仍被 mask (IRQF_ONESHOT)
+    → my_hardirq(irq, dev) → return IRQ_WAKE_THREAD
+    → wake_up_process(action->thread)  // 唤醒 "irq/167-my_dev" 线程
+    → chip->irq_eoi()
+    → 注意: IRQF_ONESHOT 保持中断 masked！
 
-内核线程 (irq/167-eth0):
-  irq_thread()
-    → action->thread_fn(irq, dev_id)   // ★ 驱动的 threaded handler
+进程上下文 (可以睡眠):
+  内核线程 "irq/167-my_dev" 被唤醒:
+    → my_thread_fn(irq, dev)
+        可以做: mutex_lock(), i2c_transfer(), msleep()...
     → irq_finalize_oneshot()
-        → unmask_irq(desc)              // 重新 unmask，接收下一个中断
+        → chip->irq_unmask()  // 处理完才重新使能中断
 ```
 
 ---
 
-## 七、中断注册 — request_irq 内部
+## 五、request_irq 注册过程
 
+```c
+// 驱动调用:
+int irq = platform_get_irq(pdev, 0);  // 从 DT 得到 virq=167
+request_irq(irq, e1000_intr, IRQF_SHARED, "eth0", netdev);
+```
+
+内部：
 ```c
 // kernel/irq/manage.c
-int request_threaded_irq(unsigned int irq, irq_handler_t handler,
-                         irq_handler_t thread_fn, unsigned long irqflags,
-                         const char *devname, void *dev_id)
-{
-    struct irq_desc *desc = irq_to_desc(irq);
-    struct irqaction *action;
-
-    // 分配 irqaction
-    action = kzalloc(sizeof(*action), GFP_KERNEL);
-    action->handler = handler;
-    action->thread_fn = thread_fn;
-    action->flags = irqflags;
-    action->name = devname;
-    action->dev_id = dev_id;
-
-    // 如果有 thread_fn，创建内核线程
-    if (thread_fn)
-        setup_irq_thread(action, irq);  // 创建 "irq/167-eth0" 线程
-
-    // ★ 将 action 挂到 desc->action 链表
-    __setup_irq(irq, desc, action);
-    //  → 检查 IRQF_SHARED 兼容性
-    //  → irq_startup(desc) → chip->irq_unmask() 使能硬件中断
-
-    return 0;
-}
+request_irq(irq, handler, flags, name, dev_id)
+    → request_threaded_irq(irq, handler, NULL, flags, name, dev_id)
+        │
+        ├── desc = irq_to_desc(irq)      // 找到 irq_desc[167]
+        │
+        ├── action = kzalloc(irqaction)   // 创建执行人
+        │     action->handler = e1000_intr
+        │     action->name = "eth0"
+        │     action->dev_id = netdev
+        │     action->flags = IRQF_SHARED
+        │
+        ├── __setup_irq(irq, desc, action)
+        │     ├── 如果 IRQF_SHARED: 检查已有 action 的 flags 兼容
+        │     ├── 挂到 desc->action 链表尾部
+        │     └── irq_startup(desc)
+        │           → chip->irq_unmask()  // ★ 使能硬件中断
+        │
+        └── 返回 0 (成功)
 ```
 
 ---
 
-## 八、中断亲和性 (Affinity)
+## 六、中断屏蔽与使能
 
 ```c
-// 设置中断只在特定 CPU 上处理:
-irq_set_affinity(irq, cpumask);
-    → chip->irq_set_affinity(data, cpumask, force)
-        → GIC: 写 GICD_IROUTER 寄存器，路由到指定 CPU
+// 驱动中临时屏蔽:
+disable_irq(irq);   // desc->depth++, 如果 0→1 则 chip->irq_mask()
+enable_irq(irq);    // desc->depth--, 如果 1→0 则 chip->irq_unmask()
 
-// 用户空间设置:
-echo 2 > /proc/irq/167/smp_affinity   // 绑定到 CPU 1
-echo f > /proc/irq/167/smp_affinity   // CPU 0-3 均可
+// 嵌套安全:
+disable_irq(167);   // depth: 0→1, mask 硬件
+disable_irq(167);   // depth: 1→2, 不重复 mask
+enable_irq(167);    // depth: 2→1, 不 unmask
+enable_irq(167);    // depth: 1→0, unmask 硬件 ← 最后一次 enable 才真正打开
+
+// 在中断 handler 中用 (不等待当前 handler 完成):
+disable_irq_nosync(irq);
 ```
 
 ---
 
-## 九、完整时序示例
+## 七、中断亲和性
+
+```bash
+# 查看 IRQ 167 当前在哪个 CPU 处理:
+cat /proc/irq/167/smp_affinity      # 返回 cpumask, 如 "f" = CPU0-3
+
+# 绑定到 CPU 2:
+echo 4 > /proc/irq/167/smp_affinity  # 4 = bit2 = CPU2
+
+# 内核内部:
+irq_set_affinity(167, cpumask_of(2));
+    → gic_set_affinity()
+        → 写 GICD_IROUTER[72] = CPU2 的 affinity 值
+        → GIC 后续只把 hwirq 72 送给 CPU2
+```
+
+---
+
+## 八、时序图
 
 ```
-时间 ──────────────────────────────────────────────────────────────────▶
+时间 ─────────────────────────────────────────────────────────────────▶
 
-硬件                    CPU                       内核线程
-─────                   ───                       ────────
+硬件                  CPU (硬中断上下文)            内核线程
+────                  ────────────────            ────────
 
-网卡收到包
-  │ 拉高 IRQ 线
-  ▼
+网卡收包完成
+ │ 拉 IRQ
+ ▼
 GIC 记录 pending
-GIC → CPU (IRQ signal)
-                    EL1h_irq 入口
-                    保存寄存器
-                    gic_handle_irq()
-                      IAR 读 → hwirq=72
-                      domain lookup → virq=167
-                      handle_fasteoi_irq()
-                        e1000_intr() → 关 DMA 中断
-                        return IRQ_WAKE_THREAD
-                        wake_up(irq/167-e1000)
-                      chip->irq_eoi() (GICD_EOIR)
-                    irq_exit()
-                      softirq pending? → invoke
-                    恢复寄存器, eret
-                                                  irq/167-e1000 被唤醒
-                                                  e1000_thread_fn()
-                                                    NAPI poll 收包
-                                                    处理完毕
-                                                  unmask_irq()
-                                                  → 网卡中断重新使能
+GIC → CPU IRQ
+                   异常入口 (保存寄存器)
+                   gic_handle_irq()
+                     读 IAR → hwirq=72
+                     domain revmap → desc[167]
+                     handle_fasteoi_irq()
+                       e1000_intr()
+                         关网卡中断
+                         return IRQ_WAKE_THREAD
+                       wake_up(irq/167-eth0)
+                       eoi(72)
+                   irq_exit()
+                     raise_softirq(NET_RX)
+                     invoke_softirq()
+                       net_rx_action()     ← softirq 中收包
+                   eret (恢复被打断的代码)
+                                              irq/167-eth0 醒来
+                                              thread_fn()
+                                                后续处理
+                                              unmask → 网卡中断再次使能
 ```
 
 ---
 
-## 十、源文件索引
+## 九、源文件索引
 
 | 文件 | 内容 |
 |------|------|
-| `arch/arm64/kernel/entry.S` | 异常向量表，el1_irq 入口 |
-| `drivers/irqchip/irq-gic-v3.c` | GICv3: gic_handle_irq, chip ops |
-| `kernel/irq/irqdomain.c` | domain: 创建、映射、revmap 查找 |
+| `arch/arm64/kernel/entry.S` | 异常向量表, el1h_64_irq |
+| `drivers/irqchip/irq-gic-v3.c` | gic_handle_irq, gic_chip |
+| `kernel/irq/irqdomain.c` | generic_handle_domain_irq, revmap |
 | `kernel/irq/chip.c` | handle_fasteoi_irq, handle_level_irq |
 | `kernel/irq/handle.c` | handle_irq_event, 遍历 action |
-| `kernel/irq/manage.c` | request_irq, setup_irq, 线程创建 |
-| `kernel/irq/irqdesc.c` | irq_desc 分配 |
-| `include/linux/irq.h` | irq_data, irq_chip 定义 |
-| `include/linux/interrupt.h` | irqaction, request_irq API |
+| `kernel/irq/manage.c` | request_irq, enable/disable_irq |
+| `include/linux/interrupt.h` | request_irq API, IRQF_* 标志 |
