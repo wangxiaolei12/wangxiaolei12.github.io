@@ -68,13 +68,51 @@ GIC    hwirq=5   →  virq=5
 ═══════════════════════════════════════════════════════════
 
 platform_get_irq(pdev, 0):
-  → 问 GIC 的 irq_domain："hwirq=72 对应什么 virq？"
-  → domain 分配 virq=167
-  → 创建 irq_desc[167]，填好 irq_data:
-        .hwirq = 72
-        .chip = &gic_chip      (绑定遥控器)
-        .domain = &gic_domain  (记住电话簿)
-  → 返回 virq=167 给网卡驱动
+  → platform_get_irq_affinity()
+      → of_irq_get(dev->of_node, 0)          [drivers/of/irq.c]
+          │
+          ├── of_irq_parse_one(node, 0, &oirq)
+          │     解析 DT: interrupts = <GIC_SPI 72 IRQ_TYPE_LEVEL_HIGH>
+          │     → oirq = {np=gic_node, args=[0, 72, 4]}
+          │              (0=SPI, 72=中断号, 4=LEVEL_HIGH)
+          │
+          ├── irq_find_host(oirq.np)
+          │     通过 GIC 的 DT 节点找到 gic_domain
+          │
+          └── irq_create_of_mapping(&oirq)    [kernel/irq/irqdomain.c]
+                → irq_create_fwspec_mapping(&fwspec)
+                    │
+                    ├── ① irq_domain_translate(gic_domain, fwspec, &hwirq, &type)
+                    │     调 gic_domain->ops->translate()
+                    │     → gic_irq_domain_translate():
+                    │       SPI 72 → hwirq = 72 + 32 = 104 (INTID)
+                    │       type = IRQ_TYPE_LEVEL_HIGH
+                    │       (SPI 号 + 32 = GIC INTID, 因为 0-15 是 SGI, 16-31 是 PPI)
+                    │
+                    ├── ② irq_find_mapping(domain, hwirq=104)
+                    │     查 revmap: 此 hwirq 以前映射过吗？
+                    │     → 没有 (返回 0)
+                    │
+                    ├── ③ irq_domain_alloc_irqs_locked(domain, ...)
+                    │     ├── __irq_alloc_descs() → 分配 virq=167
+                    │     │     分配全局唯一的 virq 编号
+                    │     │     创建 irq_desc[167]
+                    │     │
+                    │     └── gic_domain->ops->alloc(domain, virq=167, 1, fwspec)
+                    │           → gic_irq_domain_alloc()
+                    │               ├── irq_data->hwirq = 104
+                    │               ├── irq_data->chip = &gic_chip
+                    │               ├── irq_data->domain = gic_domain
+                    │               └── irq_set_handler(167, handle_fasteoi_irq)
+                    │
+                    └── ④ 返回 virq = 167
+
+  → platform_get_irq 返回 167 给网卡驱动
+
+关键点:
+  - virq 是在这里"按需分配"的，不是提前全部创建
+  - irq_desc 也是这时候才创建 (CONFIG_SPARSE_IRQ)
+  - 如果同一个 hwirq 被第二次请求，②步会命中缓存，直接返回已有 virq
 
 ═══════════════════════════════════════════════════════════
  第三步：网卡驱动 request_irq(167, e1000_intr, ...)
