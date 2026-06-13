@@ -227,6 +227,40 @@ struct device {
 };
 ```
 
+**device_add 不扫描设备树！它只是"注册"。扫描是上层做的：**
+
+```
+系统启动时设备是怎么来的？
+
+内核启动
+    │
+    ▼
+of_platform_default_populate()              [drivers/of/platform.c]
+    │  扫描设备树根节点下所有 compatible 子节点
+    │
+    ├── 遍历每个 DT 子节点
+    │
+    └── of_platform_bus_create(child_node)
+            │
+            └── of_platform_device_create_pdata(node)
+                    │
+                    ├── of_device_alloc(node)        // ① 分配 platform_device
+                    │     ├── 解析 DT "reg" → dev->resource[] (IORESOURCE_MEM)
+                    │     ├── 解析 DT "interrupts" → dev->resource[] (IORESOURCE_IRQ)
+                    │     └── dev->dev.of_node = node
+                    │
+                    └── of_device_add(dev)           // ② 注册
+                            └── device_add(&dev->dev)  ← 到这里才调 device_add
+                                    ├── bus_add_device()
+                                    └── bus_probe_device()
+                                          → 匹配 compatible → .probe()
+
+所以:
+  of_platform_populate = 扫描 DT，创建 device
+  device_add           = 注册 device，触发 probe 匹配
+  两者职责不同！
+```
+
 **device_add() 核心流程**：
 
 ```c
