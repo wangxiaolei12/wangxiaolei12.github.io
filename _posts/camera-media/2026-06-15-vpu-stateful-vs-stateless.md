@@ -23,7 +23,7 @@ excerpt: "结合 Linux mainline 中的 CODA (Stateful) 和 Hantro (Stateless) VP
 | **固件** | VPU 内部有固件运行 | 纯硬件，无固件 |
 | **解码状态管理** | 固件管理（参考帧、DPB 等） | 用户空间管理（通过 controls 传入） |
 | **驱动复杂度** | 驱动相对简单（固件干活） | 驱动+用户空间复杂（状态在外部） |
-| **V4L2 接口** | 标准 M2M（OUTPUT→CAPTURE） | Request API + Stateless Controls |
+| **V4L2 接口** | M2M（OUTPUT→CAPTURE） | M2M + Request API + Stateless Controls |
 
 ### 1.2 架构对比图
 
