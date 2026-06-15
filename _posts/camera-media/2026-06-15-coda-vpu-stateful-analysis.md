@@ -1,7 +1,7 @@
 ---
 layout: post
 title: "CODA VPU 驱动深度分析（Stateful 编解码器）"
-date: 2026-06-15 12:00:00 +0800
+date: 2026-06-15 11:20:00 +0800
 excerpt: "深入分析 Linux mainline CODA (Chips&Media) VPU 驱动的完整工作流程：固件交互、bitstream FIFO 管理、序列初始化、多实例调度、SOURCE_CHANGE 事件处理。"
 ---
 
