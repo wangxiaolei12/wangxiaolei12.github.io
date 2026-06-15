@@ -363,14 +363,14 @@ clk = devm_clk_get(dev, NULL);
 
 ```c
 struct ListNode* reverseList(struct ListNode* head) {
-    struct ListNode *prev = NULL, *curr = head;
+    struct ListNode *temp = NULL, *curr = head;
     while (curr) {
         struct ListNode *next = curr->next;
-        curr->next = prev;
-        prev = curr;
+        curr->next = temp;
+        temp = curr;
         curr = next;
     }
-    return prev;
+    return temp;
 }
 ```
 
@@ -382,14 +382,14 @@ struct ListNode* reverseKGroup(struct ListNode* head, int k) {
     int count = 0;
     while (cur && count < k) { cur = cur->next; count++; }
     if (count < k) return head;
-    struct ListNode *prev = reverseKGroup(cur, k);
+    struct ListNode *temp = reverseKGroup(cur, k);
     while (count--) {
         struct ListNode *next = head->next;
-        head->next = prev;
-        prev = head;
+        head->next = temp;
+        temp = head;
         head = next;
     }
-    return prev;
+    return temp;
 }
 ```
 
