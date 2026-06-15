@@ -115,6 +115,78 @@ drm_gpu_scheduler
 ├── work_run_job    (提交下一个 job)
 ├── work_free_job   (释放完成的 job)
 └── work_tdr        (超时检测)
+```
+
+#### 优先级队列的使用者
+
+| 队列 | 使用者 | 具体场景 |
+|------|--------|----------|
+| **KERNEL** | 内核驱动自身 | GPU 页表更新、BO 搬移（VRAM↔GTT）、内部 context 切换、eviction |
+| **HIGH** | 特权用户进程 | VR 合成器（SteamVR）、视频解码关键路径、用户通过 ioctl 显式请求提权的 context |
+| **NORMAL** | 普通用户进程（默认） | 游戏渲染、桌面合成（Xorg/Wayland）、OpenCL 计算、大多数 GPU 任务 |
+| **LOW** | 后台/批量任务 | 后台 shader 编译、离线渲染、不紧急的 GPGPU 计算 |
+
+以 amdgpu 为例：
+
+```c
+// 内核态 BO 搬移（驱动内部）→ KERNEL
+// TTM 把显存中的 buffer 搬到 GTT：
+amdgpu_copy_buffer() → 创建 job → push 到 KERNEL 队列
+
+// 用户 Vulkan 游戏提交渲染命令 → NORMAL（默认）
+// vkQueueSubmit() → ioctl → amdgpu 创建 job → push 到 NORMAL 队列
+
+// VR 合成器请求高优先级 → HIGH
+// 通过 ioctl: AMDGPU_CTX_OP_SET_PRIORITY → DRM_SCHED_PRIORITY_HIGH
+
+// 后台 shader 预编译 → LOW
+// 通过 context 参数降低优先级
+```
+
+调度行为——**严格优先级**：
+
+```
+每次 work_run_job 触发：
+
+for (i = KERNEL; i < num_rqs; i++) {     // 从最高优先级开始
+    entity = select_from_rq(sched_rq[i]);
+    if (entity) break;                    // 找到就停，不看更低的
+}
+
+结果：
+- KERNEL 有 job → 其他全等着
+- KERNEL 空，HIGH 有 job → NORMAL/LOW 等着
+- 只有高优先级都空时，低优先级才有机会执行
+```
+
+**为什么 KERNEL 必须最高优先级**：
+
+GPU 内存管理（eviction/migration）必须最高优先级，否则会死锁：
+
+```
+场景：显存满了，新 job 需要分配显存
+1. TTM 需要 evict 旧 BO → 创建搬移 job（KERNEL）
+2. 如果搬移 job 排在用户 job 后面 →
+   用户 job 等显存分配 → 搬移 job 等用户 job 完成 → 死锁！
+
+所以 KERNEL 必须能抢占所有用户任务优先执行。
+```
+
+**谁设置优先级**：
+
+```c
+// 驱动内部任务 → 硬编码 KERNEL
+drm_sched_entity_init(&entity, DRM_SCHED_PRIORITY_KERNEL, ...);
+
+// 用户态创建 GPU context 时通过 ioctl 指定
+amdgpu_ctx_ioctl(AMDGPU_CTX_OP_SET_PRIORITY, priority)
+    → drm_sched_entity_set_priority(entity, DRM_SCHED_PRIORITY_HIGH);
+
+// 默认不指定 → NORMAL
+drm_sched_entity_init(&entity, DRM_SCHED_PRIORITY_NORMAL, ...);
+```
+
+```
 
 drm_sched_entity
 ├── job_queue (SPSC): [job1] → [job2] → [job3]  (用户提交的 job 队列)
