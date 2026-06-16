@@ -127,27 +127,119 @@ PMU 只是把信号线连到计数器上，不会干扰程序执行。
 
 ---
 
-## 二、软件事件 — 没有硬件支持怎么办
+## 二、事件类型全览 — 硬件 / 软件 / Tracepoint
 
-不是所有事件都有 PMU 计数器。内核用软件模拟：
+### 2.1 硬件事件 (PMU 计数器直接数)
+
+CPU 内部有信号线，PMU 计数器挂上去就能自动计数：
+
+| 事件 | 含义 | 用途 |
+|------|------|------|
+| `cpu-cycles` (或 `cycles`) | CPU 时钟周期数 | 最常用，默认采样事件 |
+| `instructions` | 执行的指令数 | 算 IPC |
+| `cache-references` | 缓存访问次数 | 缓存命中率分析 |
+| `cache-misses` | 缓存未命中次数 | 找内存瓶颈 |
+| `branch-instructions` | 分支指令数 | |
+| `branch-misses` | 分支预测失败次数 | 找不可预测分支 |
+| `bus-cycles` | 总线周期 | |
+| `stalled-cycles-frontend` | 前端停顿 | 取指/解码瓶颈 |
+| `stalled-cycles-backend` | 后端停顿 | 执行/访存瓶颈 |
+
+**硬件缓存事件（更细粒度）：**
+
+| 事件 | 含义 |
+|------|------|
+| `L1-dcache-loads` | L1 数据缓存读次数 |
+| `L1-dcache-load-misses` | L1 数据缓存读未命中 |
+| `L1-icache-load-misses` | L1 指令缓存未命中 |
+| `LLC-loads` | 末级缓存(L3)读次数 |
+| `LLC-load-misses` | 末级缓存读未命中 → 访问内存 |
+| `dTLB-load-misses` | 数据 TLB 未命中 |
+| `iTLB-load-misses` | 指令 TLB 未命中 |
+
+> 具体支持哪些取决于 CPU 型号。`perf list` 查看。
+
+### 2.2 软件事件 (内核代码埋点)
+
+| 事件 | 含义 | 内核实现位置 |
+|------|------|-------------|
+| `cpu-clock` | CPU 时钟（时间采样） | hrtimer 定时中断 |
+| `task-clock` | 任务运行时钟 | hrtimer |
+| `page-faults` (或 `faults`) | 缺页异常次数 | handle_mm_fault() 中 count++ |
+| `minor-faults` | 次要缺页（页在内存中） | 同上 |
+| `major-faults` | 主要缺页（需要磁盘 IO） | 同上 |
+| `context-switches` (或 `cs`) | 上下文切换次数 | schedule() 中 count++ |
+| `cpu-migrations` | CPU 迁移次数 | set_task_cpu() 中 count++ |
+| `alignment-faults` | 对齐异常 | 异常 handler 中 |
+
+### 2.3 Tracepoint 事件 (内核静态埋点，几千个)
+
+```bash
+perf list tracepoint | head -20
+
+# 常用:
+sched:sched_switch          # 上下文切换详情 (从谁切到谁)
+sched:sched_wakeup          # 进程被唤醒
+irq:irq_handler_entry       # 中断处理开始
+irq:irq_handler_exit        # 中断处理结束
+block:block_rq_issue        # 块 IO 请求发出
+net:net_dev_xmit            # 网络包发送
+kmem:kmalloc                # 内存分配
+kmem:kfree                  # 内存释放
+```
+
+### 2.4 为什么需要软件事件？
+
+**原因一：有些事件硬件根本数不了**
+
+PMU 只能数 CPU 微架构内部的事件（流水线上有信号线的）。但 `page-faults`、`context-switches` 这些是**内核逻辑概念**，不是硬件能感知的：
 
 ```
-cpu-clock (最常用的软件采样事件):
-  → 内核设一个 hrtimer，每 1/freq 秒触发中断
-  → 中断时记录 PC 和调用栈
-  → 效果类似 PMU 采样，但精度稍低（受调度影响）
-  → 适用于没有 PMU 或 PMU counter 用完的情况
+PMU 能数的:   cycles, instructions, cache-miss
+              ↑ CPU 内部有"事件信号线"连到计数器
 
-page-faults:
-  → 每次缺页异常时 count++
-  → 不是采样，是精确计数
-
-context-switches:
-  → 每次 schedule() 时 count++
-
-cpu-migrations:
-  → 每次任务迁移 CPU 时 count++
+PMU 数不了的: page-fault    ← 这是软件处理的异常
+              context-switch ← 这是调度器的行为
+              cpu-migration  ← 这是负载均衡的结果
+              没有硬件信号线，PMU 看不到这些！
 ```
+
+**原因二：硬件计数器数量有限**
+
+ARM64 通常只有 6 个 PMU 计数器。如果你同时想监控 10 个事件，硬件不够用：
+
+```
+场景: 6 个 PMU counter 已经全部用于 cache 分析:
+  counter 0: L1-dcache-loads
+  counter 1: L1-dcache-load-misses
+  counter 2: L1-icache-load-misses
+  counter 3: LLC-loads
+  counter 4: LLC-load-misses
+  counter 5: dTLB-load-misses
+
+  还想同时做 CPU profiling → 没有空闲 counter 了！
+  解决: 用 cpu-clock (软件 hrtimer) 做采样
+        不占 PMU counter，效果接近 cycles 采样
+```
+
+**总结：**
+```
+硬件事件: PMU 计数器，零开销，精确，但数量有限(6-8个)，只能数微架构事件
+软件事件: 内核代码埋点，不受硬件限制，能统计任何内核逻辑行为
+两者互补！
+```
+
+### 2.5 怎么选事件？
+
+| 你想分析什么 | 用什么事件 |
+|-------------|-----------|
+| 哪个函数 CPU 占用高 | `cycles` (默认) 或 `cpu-clock` |
+| 程序 IPC 低为什么 | `cycles` + `instructions` |
+| 缓存是否是瓶颈 | `cache-misses` 或 `L1-dcache-load-misses` |
+| 分支预测差 | `branch-misses` |
+| 内存分配频繁 | `page-faults` 或 `kmem:kmalloc` |
+| 频繁切换 | `context-switches` 或 `sched:sched_switch` |
+| IO 延迟 | `block:block_rq_issue` + `block:block_rq_complete` |
 
 ---
 
