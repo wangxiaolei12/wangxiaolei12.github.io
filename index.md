@@ -68,6 +68,14 @@ description: "Xiaolei Wang's blog about Linux kernel development, graphics progr
 </div>
 </a>
 
+<a href="/category/userspace-tools/" style="text-decoration: none; color: inherit;">
+<div style="border: 1px solid #444; border-radius: 8px; padding: 1.5rem; transition: transform 0.2s;">
+<h2 style="margin-top: 0;">🔧 Userspace Tools</h2>
+<p>perf、ftrace、crash 等调试分析工具原理与使用</p>
+<p style="opacity: 0.6;">{{ site.posts | where_exp: "p", "p.path contains 'userspace-tools/'" | size }} 篇文章</p>
+</div>
+</a>
+
 <a href="/category/interview/" style="text-decoration: none; color: inherit;">
 <div style="border: 1px solid #444; border-radius: 8px; padding: 1.5rem; transition: transform 0.2s;">
 <h2 style="margin-top: 0;">📝 Interview</h2>
