@@ -615,4 +615,299 @@ int trap(int *h, int n) {
 
 ---
 
+## 十三、内存使用过高排查
+
+### 快速三板斧
+
+```bash
+free -h                                               # 全局概览
+ps aux --sort=-%mem | head -10                        # 哪个进程吃的
+cat /proc/meminfo | grep -E "MemAvailable|AnonPages|Slab|Shmem|SUnreclaim|SwapFree"
+```
+
+### /proc/meminfo 关键字段
+
+| 字段 | 含义 | 高了说明什么 |
+|------|------|-------------|
+| MemAvailable | **实际可用**（含可回收 cache） | 这个低才是真紧张 |
+| AnonPages | 匿名页（堆栈） | 进程吃内存 |
+| Slab / SUnreclaim | 内核对象缓存 | 内核内存泄漏 |
+| Shmem | tmpfs + 共享内存 | 查 /dev/shm |
+| Buffers + Cached | 文件缓存（可回收） | 高是正常的 |
+
+### 进程级排查
+
+```bash
+# 按 RSS 排序
+ps -eo pid,user,rss,vsize,comm --sort=-rss | head -20
+
+# 单进程详细
+cat /proc/<pid>/smaps_rollup    # Rss/Pss/Anonymous/Swap
+pmap -x <pid> | tail -5
+
+# 监控是否持续增长（判断泄漏）
+watch -n 5 "ps -o pid,rss,comm -p <pid>"
+```
+
+### 内核内存排查
+
+```bash
+# Slab 消耗
+slabtop -o -s c | head -20
+
+# vmalloc 区域
+cat /proc/vmallocinfo | awk '{sum+=$2} END {print sum/1024/1024 " MB"}'
+
+# kmemleak（需 CONFIG_DEBUG_KMEMLEAK=y）
+echo scan > /sys/kernel/debug/kmemleak
+cat /sys/kernel/debug/kmemleak
+```
+
+### tmpfs / 共享内存
+
+```bash
+grep Shmem /proc/meminfo
+df -h | grep tmpfs
+du -sh /dev/shm/*
+```
+
+### 排查流程
+
+```
+内存紧张？
+├─ free -h 看 available
+│    └─ buff/cache 高但 available 正常 → 没问题
+├─ ps --sort=-%mem → 哪个进程？
+│    ├─ RSS 巨大且持续增长 → 用户态泄漏（valgrind）
+│    └─ 进程加起来对不上 → 内核占的
+├─ /proc/meminfo 看 Slab / Shmem / AnonPages
+│    ├─ Slab(SUnreclaim) 高 → slabtop / kmemleak
+│    ├─ Shmem 高 → tmpfs + /dev/shm
+│    └─ AnonPages 高 → 进程堆内存
+└─ OOM 已发生 → dmesg | grep -i "oom\|killed"
+```
+
+### OOM 相关
+
+```bash
+# 查看 OOM 日志
+dmesg | grep -i "oom\|killed\|out of memory" -A 20
+
+# 保护关键进程不被 OOM Killer 杀
+echo -1000 > /proc/<pid>/oom_score_adj
+```
+
+---
+
+## 十三、文件系统裁剪
+
+### 裁剪思路
+
+核心原则：只保留系统运行所必需的文件，删除一切不需要的。
+
+### 可裁剪目录
+
+| 目录 | 可裁剪内容 | 说明 |
+|------|-----------|------|
+| `/usr/share` | man、doc、locale、info、zoneinfo | 文档/本地化 |
+| `/usr/include` | 所有头文件 | 运行时不需要 |
+| `/usr/lib` | 静态库 `*.a`、不用的 `.so` | 只保留运行时动态库 |
+| `/lib/modules` | 不用的内核模块 | 只留需要的驱动 |
+| `/var/cache` | 包管理器缓存 | 清空 |
+
+### 常用裁剪操作
+
+```bash
+# 删除文档
+rm -rf /target/usr/share/{man,doc,info}
+
+# 只保留需要的 locale
+cd /target/usr/share/locale && ls | grep -v "en_US" | xargs rm -rf
+
+# 删除头文件和静态库
+rm -rf /target/usr/include
+find /target -name "*.a" -delete
+
+# strip 二进制和动态库（去调试符号）
+find /target -type f -executable -exec strip --strip-unneeded {} \; 2>/dev/null
+find /target -name "*.so*" -exec strip --strip-unneeded {} \; 2>/dev/null
+```
+
+### BusyBox 替换工具链
+
+```bash
+# 一个 ~1MB 的 busybox 替代上百个命令
+busybox --install -s /target/bin
+```
+
+### 依赖分析法（最小 rootfs）
+
+```bash
+# 分析程序依赖的共享库
+ldd /target/usr/bin/my_app
+
+# 只复制需要的到新 rootfs
+mkdir -p /newroot/{bin,lib,etc,dev,proc,sys,tmp}
+cp /target/usr/bin/my_app /newroot/bin/
+# 复制 ldd 列出的所有 .so
+```
+
+### 构建工具自动裁剪
+
+| 工具 | 适用场景 |
+|------|---------|
+| Buildroot | 嵌入式，从源码构建精简 rootfs |
+| Yocto/OE | 嵌入式，高度可定制 |
+| Alpine Linux | 容器/轻量系统，基于 musl + busybox |
+
+### 裁剪效果参考
+
+| 方案 | rootfs 大小 |
+|------|------------|
+| 完整 Ubuntu | ~1-2 GB |
+| Alpine Linux | ~5 MB |
+| BusyBox + musl 手动构建 | ~1-3 MB |
+
+### 注意事项
+
+```
+- strip 前备份原始文件
+- ldd 确认没有漏掉动态库依赖
+- 注意 NSS 模块（libnss_*.so），ldd 不一定列全
+- 裁剪后必须实际启动测试
+```
+
+---
+
 *BSP 岗算法一般不超过 LeetCode Medium，但 C 实现和指针操作是加分项。内核知识占面试 60-70%，算法占 20-30%。*
+
+
+---
+
+## 十二、系统从上电到 Shell 的完整启动流程
+
+### 全景图
+
+```
+上电
+ │
+ ▼
+┌─────────────────────────────────────────────────┐
+│ 1. ROM Code (BootROM)                           │
+│    - 芯片内固化代码，不可修改                      │
+│    - 初始化最基本硬件（CPU 时钟、基本 IO）          │
+│    - 根据 boot pin/fuse 决定从哪里加载下一级       │
+│      (eMMC / SD / NAND / SPI NOR / USB)          │
+│    - 加载 SPL/TPL 到内部 SRAM（DDR 还没初始化）    │
+│    - 跳转到 SPL                                  │
+└─────────────────────┬───────────────────────────┘
+                      ▼
+┌─────────────────────────────────────────────────┐
+│ 2. SPL (Secondary Program Loader)               │
+│    - 运行在 SRAM 中（几十~几百 KB）               │
+│    - 初始化 DDR 控制器 → DDR 可用                 │
+│    - 初始化基本时钟树                              │
+│    - 从存储加载完整 U-Boot 到 DDR                  │
+│    - 跳转到 U-Boot                               │
+└─────────────────────┬───────────────────────────┘
+                      ▼
+┌─────────────────────────────────────────────────┐
+│ 3. U-Boot (完整 Bootloader)                     │
+│    - 运行在 DDR 中                               │
+│    - 初始化更多外设（网络、USB、显示、存储）         │
+│    - 提供命令行环境（可交互调试）                   │
+│    - 从存储/网络加载：                             │
+│      • kernel image (Image/zImage)               │
+│      • DTB (设备树)                              │
+│      • initramfs（可选）                          │
+│    - 设置 bootargs（内核命令行参数）               │
+│    - 跳转到 kernel 入口                          │
+└─────────────────────┬───────────────────────────┘
+                      ▼
+┌─────────────────────────────────────────────────┐
+│ 4. Kernel 启动                                   │
+│                                                 │
+│ 4.1 汇编阶段 (head.S)                            │
+│    - 设置 MMU 页表、使能 MMU                      │
+│    - 设置异常向量表                               │
+│    - 跳转到 start_kernel()                       │
+│                                                 │
+│ 4.2 start_kernel()                              │
+│    - setup_arch(): 解析 DTB、初始化内存布局        │
+│    - mm_init(): 伙伴系统、slab 初始化             │
+│    - sched_init(): 调度器初始化                   │
+│    - init_IRQ(): 中断控制器初始化                  │
+│    - time_init(): 定时器初始化                    │
+│    - rest_init(): 创建 init 和 kthreadd 线程     │
+│                                                 │
+│ 4.3 kernel_init (PID=1)                         │
+│    - 设备驱动初始化（按 initcall 级别依次调用）     │
+│    - 挂载 rootfs                                 │
+│      • initramfs → 或直接 mount root 分区        │
+│    - 执行 /sbin/init（或 systemd）               │
+└─────────────────────┬───────────────────────────┘
+                      ▼
+┌─────────────────────────────────────────────────┐
+│ 5. Init 进程 (systemd / busybox init)           │
+│    - PID 1，所有用户进程的祖先                    │
+│    - 挂载文件系统 (/proc, /sys, /dev)            │
+│    - 启动系统服务（网络、日志、udev 等）           │
+│    - 启动 getty → login → shell                  │
+└─────────────────────┬───────────────────────────┘
+                      ▼
+              用户拿到 Shell
+```
+
+### 各阶段运行位置
+
+| 阶段 | 运行在哪 | 为什么 |
+|------|----------|--------|
+| ROM Code | 芯片内 ROM | 固化不可改 |
+| SPL | 内部 SRAM | DDR 还没初始化 |
+| U-Boot | DDR | SPL 已初始化 DDR |
+| Kernel | DDR | 虚拟地址空间 |
+| Init/Shell | DDR | 用户空间 |
+
+### 面试常见追问
+
+**Q: 为什么需要 SPL，不能直接加载 U-Boot？**
+> ROM Code 只能访问内部 SRAM（几十~几百 KB），完整 U-Boot 太大放不下。SPL 是精简版 bootloader，只做 DDR 初始化 + 加载完整 U-Boot。
+
+**Q: kernel 怎么知道设备树在哪？**
+> U-Boot 把 dtb 加载到 DDR 某地址，通过寄存器（ARM64 是 x0）把 dtb 地址传给 kernel 入口。
+
+**Q: initramfs 是什么？为什么需要它？**
+> 临时的内存根文件系统。kernel 需要先挂载 rootfs 才能执行 init，但挂载真正的 root 分区可能需要驱动（如 NVMe、LVM、加密）。initramfs 里有这些驱动和工具，帮 kernel 过渡到真正的 rootfs。
+
+**Q: initcall 有哪些级别？**
+```c
+#define pure_initcall(fn)       // 0 - 最早
+#define core_initcall(fn)       // 1
+#define postcore_initcall(fn)   // 2
+#define arch_initcall(fn)       // 3
+#define subsys_initcall(fn)     // 4
+#define fs_initcall(fn)         // 5
+#define device_initcall(fn)     // 6 - module_init 默认级别
+#define late_initcall(fn)       // 7 - 最晚
+```
+
+**Q: 如果系统卡在启动过程中，怎么定位卡在哪一步？**
+> - U-Boot 阶段：打开 `CONFIG_BOOTSTAGE`，或加 `initcall_debug` 给 bootargs
+> - Kernel 阶段：bootargs 加 `initcall_debug`，dmesg 会打印每个 initcall 的函数名和耗时
+> - Init 阶段：看 systemd journal 或 `/var/log/boot.log`
+
+### 时间参考（典型嵌入式 ARM）
+
+| 阶段 | 耗时 |
+|------|------|
+| ROM → SPL | ~100ms |
+| SPL（含 DDR 初始化） | ~200ms |
+| U-Boot | ~1-3s |
+| Kernel 到挂载 rootfs | ~2-5s |
+| Init 到 Shell | ~1-10s（取决于服务多少） |
+
+### 一句话总结
+
+```
+ROM → SPL(初始化DDR) → U-Boot(加载kernel+dtb) → Kernel(初始化子系统+挂载rootfs) → Init → Shell
+```
