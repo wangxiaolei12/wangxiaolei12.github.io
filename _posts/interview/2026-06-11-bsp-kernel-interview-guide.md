@@ -779,6 +779,141 @@ cp /target/usr/bin/my_app /newroot/bin/
 
 ---
 
+---
+
+## 十四、I2C 驱动怎么写
+
+### I2C 驱动分层
+
+```
+I2C Client Driver（设备驱动：sensor、PMIC、EEPROM）← 面试问这个
+I2C Core（框架层）
+I2C Adapter Driver（控制器驱动：i2c-imx、i2c-designware）← SoC 厂商写
+```
+
+### 最小框架
+
+```c
+#include <linux/i2c.h>
+#include <linux/regmap.h>
+
+struct my_device {
+    struct regmap *regmap;
+    struct i2c_client *client;
+};
+
+static const struct regmap_config my_regmap_config = {
+    .reg_bits = 8,
+    .val_bits = 8,
+    .max_register = 0xFF,
+};
+
+static int my_probe(struct i2c_client *client)
+{
+    struct my_device *dev;
+    unsigned int chip_id;
+
+    dev = devm_kzalloc(&client->dev, sizeof(*dev), GFP_KERNEL);
+    if (!dev)
+        return -ENOMEM;
+
+    dev->regmap = devm_regmap_init_i2c(client, &my_regmap_config);
+    if (IS_ERR(dev->regmap))
+        return PTR_ERR(dev->regmap);
+
+    dev->client = client;
+    i2c_set_clientdata(client, dev);
+
+    regmap_read(dev->regmap, REG_CHIP_ID, &chip_id);
+    if (chip_id != EXPECTED_ID)
+        return -ENODEV;
+
+    regmap_write(dev->regmap, REG_CONFIG, 0x01);
+    return 0;
+}
+
+static void my_remove(struct i2c_client *client) { }
+
+static const struct of_device_id my_of_match[] = {
+    { .compatible = "vendor,my-sensor" },
+    { }
+};
+MODULE_DEVICE_TABLE(of, my_of_match);
+
+static struct i2c_driver my_driver = {
+    .driver = { .name = "my-sensor", .of_match_table = my_of_match },
+    .probe = my_probe,
+    .remove = my_remove,
+};
+module_i2c_driver(my_driver);
+```
+
+### 设备树
+
+```dts
+&i2c1 {
+    my-sensor@48 {
+        compatible = "vendor,my-sensor";
+        reg = <0x48>;
+        interrupt-parent = <&gpio1>;
+        interrupts = <5 IRQ_TYPE_EDGE_FALLING>;
+    };
+};
+```
+
+### 寄存器访问：regmap vs 原始 API
+
+```c
+// regmap（推荐）
+regmap_read(regmap, reg, &val);
+regmap_write(regmap, reg, val);
+regmap_update_bits(regmap, reg, mask, val);
+
+// smbus（简单场景）
+i2c_smbus_read_byte_data(client, reg);
+i2c_smbus_write_byte_data(client, reg, val);
+
+// i2c_transfer（复杂场景）
+struct i2c_msg msgs[2] = {
+    { .addr = client->addr, .flags = 0, .len = 1, .buf = &reg },
+    { .addr = client->addr, .flags = I2C_M_RD, .len = 1, .buf = &val },
+};
+i2c_transfer(client->adapter, msgs, 2);
+```
+
+### 资源获取
+
+```c
+clk = devm_clk_get(&client->dev, NULL);
+reset_gpio = devm_gpiod_get(&client->dev, "reset", GPIOD_OUT_HIGH);
+regulator = devm_regulator_get(&client->dev, "vdd");
+devm_request_threaded_irq(&client->dev, client->irq,
+                          NULL, handler, IRQF_ONESHOT, "name", dev);
+```
+
+### 向上注册子系统
+
+| 设备类型 | 注册方式 |
+|----------|----------|
+| hwmon（温度/电压） | `devm_hwmon_device_register_with_groups()` |
+| IIO（ADC/IMU） | `devm_iio_device_register()` |
+| Input（触摸屏） | `input_register_device()` |
+| V4L2（摄像头） | `v4l2_async_register_subdev()` |
+| RTC | `devm_rtc_device_register()` |
+
+### 面试回答要点
+
+```
+1. 注册 i2c_driver，of_match_table 匹配设备树 compatible
+2. probe 中：regmap 初始化 → 验证 chip ID → 配置硬件 → 获取 clk/gpio/regulator
+3. 向上注册子系统（hwmon/iio/input/v4l2）
+4. 中断用 threaded_irq（I2C 通信需要睡眠）
+5. 资源用 devm_ 系列自动管理
+6. 实现 runtime PM 做电源管理
+```
+
+---
+
 *BSP 岗算法一般不超过 LeetCode Medium，但 C 实现和指针操作是加分项。内核知识占面试 60-70%，算法占 20-30%。*
 
 
