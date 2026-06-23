@@ -398,7 +398,72 @@ struct cfe_fmt {
 
 ---
 
-## 9. 总结
+## 9. Media Pipeline Pad 连接图
+
+### 9.1 完整拓扑（从左到右）
+
+```
+Sensor pad[0] ──▶ CSI2 pad[0] ···内部··· CSI2 pad[4] ──▶ /dev/video0 (csi2_ch0, 图像)
+Sensor pad[1] ──▶ CSI2 pad[1] ···内部··· CSI2 pad[5] ──▶ /dev/video1 (embedded, metadata)
+                                         CSI2 pad[6] ──▶ /dev/video2 (csi2_ch2)
+                                         CSI2 pad[7] ──▶ /dev/video3 (csi2_ch3)
+
+                                         CSI2 pad[4] ──▶ FE pad[0] ──内部──▶ FE pad[2] ──▶ /dev/video4 (fe_image0)
+                                                                              FE pad[3] ──▶ /dev/video5 (fe_image1)
+                                                                              FE pad[4] ──▶ /dev/video6 (fe_stats)
+
+                                         /dev/video7 (fe_config) ──▶ FE pad[1] (配置输入)
+```
+
+### 9.2 各 Entity 的 Pad 说明
+
+| Entity | Pad 数量 | 说明 |
+|--------|---------|------|
+| Sensor (IMX500) | 2 | pad[0]=图像 SRC, pad[1]=metadata SRC |
+| CSI2 subdev | 8 (4+4) | pad[0~3]=SINK（接收）, pad[4~7]=SOURCE（输出） |
+| Video node | 1 | capture 节点=SINK，output 节点=SOURCE |
+| PiSP FE | 5 | pad[0]=图像输入 SINK, pad[1]=配置输入 SINK, pad[2~4]=输出 SOURCE |
+
+### 9.3 为什么 Metadata 不连接 PiSP FE？
+
+注意 CSI2 pad[5]（metadata）只连接到 `/dev/video1`，**不连接 PiSP FE**。原因：
+
+**PiSP FE 是图像处理引擎（ISP）**，只处理像素数据（去噪、白平衡、色彩校正等）。Metadata 是曝光参数、寄存器值等数值信息，不是像素，不需要也无法做 ISP 处理。
+
+代码中的体现：
+
+```c
+// cfe.c - cfe_link_node_pads()
+for (i = 0; i < CSI2_NUM_CHANNELS; i++) {
+    // 所有通道都连 video node
+    media_create_pad_link(&cfe->csi2.sd.entity,
+                          node_desc[i].link_pad,
+                          &node->video_dev.entity, 0, 0);
+
+    // 只有图像通道才连 FE
+    if (node_supports_image(node)) {
+        media_create_pad_link(&cfe->csi2.sd.entity,
+                              node_desc[i].link_pad,
+                              &cfe->fe.sd.entity,
+                              FE_STREAM_PAD, 0);
+    }
+}
+```
+
+`CSI2_CH1`（embedded）的 caps 是 `V4L2_CAP_META_CAPTURE`，不含 `V4L2_CAP_VIDEO_CAPTURE`，所以 `node_supports_image()` 为 false，不创建到 FE 的 link。
+
+**数据流分工**：
+
+```
+像素数据：  CSI2 pad[4] ──▶ FE ──▶ ISP处理 ──▶ /dev/video4（处理后的图像）
+Metadata： CSI2 pad[5] ──▶ /dev/video1 ──▶ 用户空间直接读取（无需处理）
+```
+
+Metadata 由用户空间（如 libcamera）直接读取，用来决定下一帧的曝光/增益控制策略。
+
+---
+
+## 10. 总结
 
 | 概念 | 一句话解释 |
 |------|-----------|
