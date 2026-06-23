@@ -552,6 +552,35 @@ perf script
 
 ### 7.1 快速判断瓶颈类型
 
+**第一步：用 top 看 CPU 各项指标**
+
+```
+%Cpu(s):  1.9 us,  0.7 sy,  0.0 ni, 97.4 id,  0.0 wa,  0.0 hi,  0.0 si,  0.0 st
+```
+
+| 缩写 | 全称 | 含义 |
+|------|------|------|
+| us | user | 用户态代码（你的程序）占 CPU 的时间 |
+| sy | system | 内核态代码（系统调用、驱动）占 CPU 的时间 |
+| ni | nice | 低优先级(nice>0)用户进程占的时间 |
+| id | idle | CPU 空闲，啥都没干 |
+| wa | iowait | CPU 空闲且在等磁盘 IO 完成 |
+| hi | hardware irq | 处理硬件中断 |
+| si | software irq | 处理软中断（网络收包等） |
+| st | steal | 被虚拟机管理程序偷走的时间（虚拟化场景） |
+
+**第二步：根据 top 指标初步判断瓶颈类型**
+
+| 看什么 | 值 | 判断 |
+|--------|------|------|
+| `us + sy` 高，`wa` 低 | us=40 sy=35 wa=0 | CPU密集 或 锁(spinlock) |
+| `us` 高，`sy` 低 | us=90 sy=2 wa=0 | 纯CPU密集（用户态在算） |
+| `sy` 异常高 | us=10 sy=50 wa=0 | 内核态瓶颈（锁/调度/bounce copy） |
+| `wa` 高 | us=5 sy=3 wa=60 | IO密集 |
+| `id` 高，程序却慢 | us=3 sy=2 id=90 wa=0 | mutex等待（CPU在sleep等锁） |
+
+**第三步：进一步确认**
+
 ```
 CPU利用率高 + IPC高   → CPU密集型（在算）
 CPU利用率高 + IPC低   → 内存密集型（CPU在等cache/内存）
