@@ -400,19 +400,53 @@ struct cfe_fmt {
 
 ## 9. Media Pipeline Pad 连接图
 
-### 9.1 完整拓扑（从左到右）
+### 9.1 完整拓扑图
 
 ```
-Sensor pad[0] ──▶ CSI2 pad[0] ···内部··· CSI2 pad[4] ──▶ /dev/video0 (csi2_ch0, 图像)
-Sensor pad[1] ──▶ CSI2 pad[1] ···内部··· CSI2 pad[5] ──▶ /dev/video1 (embedded, metadata)
-                                         CSI2 pad[6] ──▶ /dev/video2 (csi2_ch2)
-                                         CSI2 pad[7] ──▶ /dev/video3 (csi2_ch3)
+┌───────────┐          ┌────────────────────────────────────┐
+│  IMX500   │          │           CSI2 subdev              │
+│  Sensor   │          │                                    │
+│           │          │  SINK(入)         SOURCE(出)        │          ┌────────────────────┐
+│ pad[0] SRC├─────────▶│ pad[0] ch0 ─── pad[4] SRC ├──────────────────▶│ /dev/video0 (图像)  │
+│ (IMAGE)   │          │                       │    │                   └────────────────────┘
+│           │          │                       │    │                   ┌────────────────────┐
+│ pad[1] SRC├─────────▶│ pad[1] ch1 ─── pad[5] SRC ├──────────────────▶│ /dev/video1 (meta)  │
+│ (META)    │          │                            │                   └────────────────────┘
+└───────────┘          │ pad[2] ch2 ─── pad[6] SRC ├──────────────────▶ /dev/video2
+                       │ pad[3] ch3 ─── pad[7] SRC ├──────────────────▶ /dev/video3
+                       │                       │    │
+                       └───────────────────────┼────┘
+                                               │
+                              CSI2 pad[4] 也连到│FE
+                                               │
+                                               ▼
+┌────────────────────┐ ┌────────────────────────────────────────────────────────────────┐
+│ /dev/video7        │ │                    PiSP FE subdev                               │
+│ (fe_config)        │ │                                                                 │
+│              SRC   ├▶│ pad[1] CONFIG (SINK)                                            │
+└────────────────────┘ │                                                                 │
+                       │ pad[0] STREAM (SINK) ◀── 图像数据                                │
+                       │                                                                 │
+                       │ pad[2] OUT0   (SRC) ──▶ /dev/video4 (fe_image0, 处理后图像)       │
+                       │ pad[3] OUT1   (SRC) ──▶ /dev/video5 (fe_image1, 处理后图像)       │
+                       │ pad[4] STATS  (SRC) ──▶ /dev/video6 (fe_stats, 统计信息)          │
+                       └─────────────────────────────────────────────────────────────────┘
+```
 
-                                         CSI2 pad[4] ──▶ FE pad[0] ──内部──▶ FE pad[2] ──▶ /dev/video4 (fe_image0)
-                                                                              FE pad[3] ──▶ /dev/video5 (fe_image1)
-                                                                              FE pad[4] ──▶ /dev/video6 (fe_stats)
+**连接关系简表**：
 
-                                         /dev/video7 (fe_config) ──▶ FE pad[1] (配置输入)
+```
+Sensor pad[0] ──SRC→SINK──▶ CSI2 pad[0]
+Sensor pad[1] ──SRC→SINK──▶ CSI2 pad[1]
+CSI2   pad[4] ──SRC→SINK──▶ /dev/video0
+CSI2   pad[5] ──SRC→SINK──▶ /dev/video1
+CSI2   pad[6] ──SRC→SINK──▶ /dev/video2
+CSI2   pad[7] ──SRC→SINK──▶ /dev/video3
+CSI2   pad[4] ──SRC→SINK──▶ FE pad[0]
+video7 pad[0] ──SRC→SINK──▶ FE pad[1]
+FE     pad[2] ──SRC→SINK──▶ /dev/video4
+FE     pad[3] ──SRC→SINK──▶ /dev/video5
+FE     pad[4] ──SRC→SINK──▶ /dev/video6
 ```
 
 ### 9.2 各 Entity 的 Pad 说明
