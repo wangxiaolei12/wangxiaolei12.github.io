@@ -548,7 +548,145 @@ perf script
 
 ---
 
-## 七、源文件索引
+## 七、性能瓶颈分类与定位方法
+
+### 7.1 快速判断瓶颈类型
+
+```
+CPU利用率高 + IPC高   → CPU密集型（在算）
+CPU利用率高 + IPC低   → 内存密集型（CPU在等cache/内存）
+CPU利用率低 + 程序慢  → IO密集型 或 锁等待（CPU在sleep）
+sy%高 + cs高          → 调度密集型（上下文切换开销大）
+```
+
+```bash
+# 一条命令快速判断
+perf stat -e cycles,instructions,cache-misses,context-switches ./your_program
+```
+
+### 7.2 CPU密集型
+
+**特征**：某个函数消耗大量 cycles。
+
+```bash
+# 定位热点函数
+perf top -a
+# 或者
+perf record -e cycles -g ./your_program
+perf report
+```
+
+**实例 — GPU SWIOTLB bounce buffer**：
+
+跑 GPU benchmark 帧率低，`perf top` 发现 `swiotlb_bounce` 占 ~20% CPU。调用链显示 etnaviv 分配 SHM buffer 时因为带了 `__GFP_HIGHMEM`，page 地址超出 GPU 寻址范围，DMA 映射走了 SWIOTLB 做 memcpy bounce。修复：对 addressing_limited 设备去掉 HIGHMEM、加 GFP_DMA32，避免 bounce buffer 拷贝。
+
+### 7.3 内存密集型
+
+**特征**：IPC 低（< 1），cache-miss 高，CPU 大部分时间在等数据从内存到来。
+
+```bash
+# 第一步：确认
+perf stat -e cycles,instructions,cache-misses,LLC-load-misses ./your_program
+# IPC < 1 + cache-miss高 = 内存瓶颈
+
+# 第二步：找到哪个函数 cache miss 多
+perf record -e cache-misses -g ./your_program
+perf report
+
+# 第三步：定位到具体哪条访存指令
+perf annotate <function_name>
+```
+
+**优化方向**：改数据布局（链表→数组）、减少指针跳转、结构体字段重排、预取(prefetch)。
+
+### 7.4 IO密集型
+
+**特征**：CPU 利用率低，`%wa` 高，程序慢。CPU 在 sleep 等磁盘/网络。
+
+```bash
+# 第一步：确认（top 看 %wa，或 vmstat 看 wa 列）
+top -d 1    # 看 %wa 是否高
+
+# 第二步：看时间花在哪个系统调用上
+perf trace -p <pid> --summary
+#  syscall    calls   total(ms)
+#  read        500     8500.0     ← 慢在read
+
+# 第三步：看磁盘是否满载
+iostat -x 1
+# await高 + %util接近100% = 磁盘瓶颈
+
+# 第四步：看具体 IO 请求延迟
+perf record -e block:block_rq_issue,block:block_rq_complete -a
+perf script
+
+# 第五步：看谁在发 IO
+perf record -e block:block_rq_insert -a -g
+perf report
+```
+
+**注意**：IO 等待时 CPU 在 sleep，`cycles` 采样抓不到。必须用 `perf trace`、block tracepoint 或 `iostat`。
+
+**优化方向**：批量 IO、异步 IO(io_uring)、加缓存、换 SSD、减少 fsync。
+
+### 7.5 锁/同步密集型
+
+**要区分两种锁**：
+
+| 锁类型 | 等锁行为 | CPU表现 | 怎么发现 |
+|--------|---------|---------|---------|
+| spinlock | 自旋忙等 | CPU利用率高 | `perf top` 看到 `spin_lock_slowpath` |
+| mutex/futex | sleep等待 | CPU利用率低 | `perf trace` 看 futex 耗时；`perf lock` |
+
+```bash
+# spinlock 竞争：cycles 直接能看到
+perf top -a
+#  25%  [kernel]  native_queued_spin_lock_slowpath  ← 自旋等锁
+
+# mutex 竞争：CPU 在 sleep，cycles 看不到，用这些方法：
+# 方法1：系统调用统计
+perf trace -p <pid> --summary
+#  futex  calls=30000  total=5000ms  ← 等锁时间
+
+# 方法2：perf lock
+perf lock record ./your_program
+perf lock report
+#  Name            acquired  contended  total wait(us)
+#  &my_lock          50000     12000       540000
+
+# 方法3：lock tracepoint 看调用栈
+perf record -e lock:contention_begin -g -a
+perf report
+# → 看到哪个函数在争哪把锁
+```
+
+**优化方向**：缩小临界区、拆锁(fine-grained)、无锁结构、per-cpu 变量、RCU。
+
+### 7.6 调度密集型
+
+**特征**：`sy%` 高、context-switch 极多，线程频繁切换但每次运行时间极短。
+
+```bash
+# 第一步：确认上下文切换过多
+perf stat -e context-switches,cpu-migrations ./your_program
+# 或 vmstat 1 看 cs 列
+
+# 第二步：看谁在频繁切换
+perf record -e sched:sched_switch -a
+perf script | head -30
+
+# 第三步：看切换次数和调度延迟
+perf sched record ./your_program
+perf sched latency
+#  Task           | Switches | Avg delay(ms)
+#  worker_thread  |  80000   |    0.05        ← 8万次切换！
+```
+
+**优化方向**：减少线程数(线程池)、批量处理(攒一批再唤醒)、协程/事件驱动替代短线程。
+
+---
+
+## 八、源文件索引
 
 | 文件 | 内容 |
 |------|------|
